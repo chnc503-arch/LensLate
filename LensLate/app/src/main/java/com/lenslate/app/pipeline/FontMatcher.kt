@@ -34,6 +34,7 @@ internal object FontMatcher {
         weightHint: Int,
         underlined: Boolean,
         struckThrough: Boolean,
+        italicHint: Boolean = false,
     ): FontMatch? {
         val normalized = text.replace('\n', ' ').trim()
         if (normalized.count { it.isLetter() } < 2 || normalized.length > MAX_TEXT_LENGTH) return null
@@ -50,7 +51,14 @@ internal object FontMatcher {
         val sourceGrid = rasterize(mask, maskWidth, sourceBox)
 
         var best: FontMatch? = null
-        FontCatalog.variants.forEach { variant ->
+        FontCatalog.matchable.forEach { variant ->
+            if (variant.italic && !italicHint) return@forEach
+            // Ink-mask IoU rewards extra coverage, so a bold face can win on a
+            // regular source purely because anti-aliasing thickened the mask.
+            // The independently measured weight has the final say on that axis.
+            if (weightHint <= MAX_REGULAR_HINT && variant.weight >= BOLD_VARIANT_WEIGHT) {
+                return@forEach
+            }
             val typeface = FontCatalog.typeface(variant.key) ?: return@forEach
             val candidate = renderCandidate(
                 text = normalized,
@@ -201,8 +209,10 @@ internal object FontMatcher {
     private const val GRID_WIDTH = 64
     private const val GRID_HEIGHT = 32
     private const val SAMPLES = 3
-    private const val MIN_MATCH_SCORE = 0.2f
+    private const val MIN_MATCH_SCORE = 0.16f
     private const val MIN_HORIZONTAL_SCALE = 0.45f
     private const val MAX_HORIZONTAL_SCALE = 1.6f
     private const val WEIGHT_BONUS = 0.03f
+    private const val MAX_REGULAR_HINT = 500
+    private const val BOLD_VARIANT_WEIGHT = 700
 }

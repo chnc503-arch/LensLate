@@ -1,0 +1,130 @@
+package com.lenslate.app.pipeline
+
+import com.lenslate.app.model.Bounds2D
+import com.lenslate.app.model.Point2D
+import com.lenslate.app.model.TextLineRecord
+import com.lenslate.app.model.TextRegionRecord
+import org.junit.Assert.assertEquals
+import org.junit.Test
+
+/** Юнит-тесты объединения строчных OCR-регионов в абзацы. */
+class OcrParagraphMergerTest {
+
+    private fun polygon(left: Float, top: Float, right: Float, bottom: Float) = listOf(
+        Point2D(left, top),
+        Point2D(right, top),
+        Point2D(right, bottom),
+        Point2D(left, bottom),
+    )
+
+    private fun region(
+        id: Int,
+        text: String,
+        left: Float,
+        top: Float,
+        right: Float,
+        bottom: Float,
+    ): TextRegionRecord {
+        val bounds = Bounds2D(left, top, right, bottom)
+        val line = TextLineRecord(
+            text = text,
+            bounds = bounds,
+            polygon = polygon(left, top, right, bottom),
+            angleDegrees = 0f,
+            confidence = 0.8f,
+            elements = emptyList(),
+        )
+        return TextRegionRecord(
+            id = id,
+            text = text,
+            bounds = bounds,
+            polygon = line.polygon,
+            script = "Cyrillic",
+            readingOrder = id - 1,
+            confidence = 0.8f,
+            overallConfidence = 0.8f,
+            lines = listOf(line),
+        )
+    }
+
+    @Test
+    fun wrappedLinesAreJoinedIntoParagraph() {
+        val first = region(1, "Устройство предназначено для обработки", 40f, 100f, 800f, 130f)
+        val second = region(2, "изображений и документов. Все вычисления", 40f, 135f, 800f, 165f)
+        val third = region(3, "локально, без передачи данных.", 40f, 170f, 800f, 200f)
+
+        val result = OcrParagraphMerger.merge(listOf(first, second, third))
+
+        assertEquals(1, result.size)
+        assertEquals(3, result[0].lines.size)
+        assertEquals("${first.text}\n${second.text}\n${third.text}", result[0].text)
+        assertEquals(100f, result[0].bounds.top, 0.01f)
+        assertEquals(200f, result[0].bounds.bottom, 0.01f)
+    }
+
+    @Test
+    fun paragraphGapKeepsRegionsSeparate() {
+        val first = region(1, "Первый абзац без точки", 40f, 100f, 800f, 130f)
+        val second = region(2, "Второй абзац после отступа", 40f, 160f, 800f, 190f)
+
+        val result = OcrParagraphMerger.merge(listOf(first, second))
+
+        assertEquals(2, result.size)
+    }
+
+    @Test
+    fun sentenceEndingListItemsStaySeparate() {
+        val first = region(1, "Влажность: не более 80 % без конденсации.", 40f, 500f, 700f, 530f)
+        val second = region(2, "Питание: 220 В, 50 Гц. Мощность: 45 Вт.", 40f, 537f, 900f, 567f)
+
+        val result = OcrParagraphMerger.merge(listOf(first, second))
+
+        assertEquals(2, result.size)
+    }
+
+    @Test
+    fun differentSizesAreNotJoined() {
+        val heading = region(1, "ТЕХНИЧЕСКИЙ ПАСПОРТ", 40f, 80f, 800f, 140f)
+        val subtitle = region(2, "Модель LX-4200 · Серия A", 40f, 155f, 500f, 185f)
+
+        val result = OcrParagraphMerger.merge(listOf(heading, subtitle))
+
+        assertEquals(2, result.size)
+    }
+
+    @Test
+    fun sideBySideColumnsAreNotJoined() {
+        val left = region(1, "Левая колонка", 40f, 300f, 400f, 330f)
+        val right = region(2, "Правая колонка", 450f, 300f, 800f, 330f)
+
+        val result = OcrParagraphMerger.merge(listOf(left, right))
+
+        assertEquals(2, result.size)
+    }
+
+    @Test
+    fun shortLastLineJoinsByLeftEdge() {
+        val first = region(1, "The paragraph continues on the next visual line", 40f, 100f, 800f, 130f)
+        val tail = region(2, "short tail", 40f, 135f, 200f, 165f)
+
+        val result = OcrParagraphMerger.merge(listOf(first, tail))
+
+        assertEquals(1, result.size)
+        assertEquals(2, result[0].lines.size)
+    }
+
+    @Test
+    fun idsAndReadingOrderAreReassigned() {
+        val first = region(9, "Начало абзаца без точки", 40f, 100f, 800f, 130f)
+        val second = region(4, "продолжение абзаца.", 40f, 135f, 800f, 165f)
+        val separate = region(7, "Отдельный блок.", 40f, 300f, 400f, 330f)
+
+        val result = OcrParagraphMerger.merge(listOf(first, second, separate))
+
+        assertEquals(2, result.size)
+        assertEquals(1, result[0].id)
+        assertEquals(0, result[0].readingOrder)
+        assertEquals(2, result[1].id)
+        assertEquals(1, result[1].readingOrder)
+    }
+}

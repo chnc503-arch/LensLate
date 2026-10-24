@@ -616,7 +616,10 @@ class OcrProcessor @Inject constructor(
             OcrSanitizerProfile.TESSERACT,
             aggressiveSanitizer,
         )
-        val regions = attachAppearance(sanitized.regions, bitmap)
+        val paragraphs = OcrParagraphMerger.merge(
+            sanitized.regions.map { it.copy(text = OcrTextRepair.repair(it.text)) },
+        )
+        val regions = attachAppearance(paragraphs.map(::markGeometry), bitmap)
         val contributingPasses = merged.contributingPassNames.ifEmpty { setOf(selected.name) }
         val summaries = passes.map { pass ->
             PreprocessingCandidate(
@@ -777,6 +780,9 @@ class OcrProcessor @Inject constructor(
             OcrSanitizerProfile.NEURAL,
             aggressiveSanitizer,
         )
+        val paragraphs = OcrParagraphMerger.merge(
+            sanitized.regions.map { it.copy(text = OcrTextRepair.repair(it.text)) },
+        )
         val contributingPasses = merged.contributingPassNames.ifEmpty { setOf(selected.name) }
         val summaries = sanitizedPasses.map { pass ->
             PreprocessingCandidate(
@@ -792,7 +798,7 @@ class OcrProcessor @Inject constructor(
         val experimentResults = if (experimentMode) summaries else emptyList()
         return ScanDocument(
             image = imageInfo,
-            regions = attachAppearance(sanitized.regions, bitmap),
+            regions = attachAppearance(paragraphs.map(::markGeometry), bitmap),
             preprocessing = PreprocessingSummary(
                 quality = plan.quality.toEstimate(),
                 candidates = summaries,

@@ -41,12 +41,18 @@ import kotlin.math.tan
 @Singleton
 class TextRenderer @Inject constructor() {
 
-    fun render(source: Bitmap, regions: List<TextRegionRecord>): Bitmap {
+    fun render(
+        source: Bitmap,
+        regions: List<TextRegionRecord>,
+        obstacles: List<TextRegionRecord> = regions,
+    ): Bitmap {
         val translated = regions.filter { !it.translation.isNullOrBlank() }
         val result = source.copy(Bitmap.Config.ARGB_8888, true) ?: return source
         if (translated.isEmpty()) return result
         val canvas = Canvas(result)
-        translated.forEach { region -> renderRegion(canvas, region) }
+        translated.forEach { region ->
+            renderRegion(canvas, region, obstacles, source.height)
+        }
         return result
     }
 
@@ -80,10 +86,16 @@ class TextRenderer @Inject constructor() {
             fontKey = appearance?.fontKey
                 ?: FontCatalog.fallbackKey(fontClass, weight, weight >= 600),
             fontMatchScore = appearance?.fontMatchScore ?: 0f,
+            linePitchPx = sourceLinePitch(region),
         )
     }
 
-    private fun renderRegion(canvas: Canvas, region: TextRegionRecord) {
+    private fun renderRegion(
+        canvas: Canvas,
+        region: TextRegionRecord,
+        obstacles: List<TextRegionRecord>,
+        imageHeight: Int,
+    ) {
         val rawText = region.translation?.takeIf { it.isNotBlank() } ?: return
         val text = MicroSpacing.transfer(region, matchSourceCase(region.text, rawText))
         val bounds = region.bounds
@@ -104,7 +116,16 @@ class TextRenderer @Inject constructor() {
             verticalJapanese -> renderVerticalJapanese(canvas, region, text, style, paint, samples)
             curve != null -> renderCurved(canvas, curve, text, style, paint, samples)
             region.isVertical -> renderRotatedColumn(canvas, region, text, style, paint, samples)
-            else -> renderHorizontal(canvas, region, text, style, paint, samples)
+            else -> renderHorizontal(
+                canvas,
+                region,
+                text,
+                style,
+                paint,
+                samples,
+                obstacles,
+                imageHeight,
+            )
         }
     }
 
@@ -134,6 +155,8 @@ class TextRenderer @Inject constructor() {
         style: TextStyle,
         paint: TextPaint,
         samples: List<TextStyleSample>,
+        obstacles: List<TextRegionRecord>,
+        imageHeight: Int,
     ) {
         val frames = sourceLineFrames(region)
         val singleSourceLine = frames.size <= 1
@@ -147,6 +170,7 @@ class TextRenderer @Inject constructor() {
         val alignment = layoutAlignment(style.alignment)
         val bounds = region.bounds
         val frame = frames.first()
+        val baseSize = calibratedSize(style, paint)
 
         val layout: StaticLayout
         val drawLeft: Float
@@ -160,25 +184,55 @@ class TextRenderer @Inject constructor() {
             // shrank every translation.
             val sizeCeiling = (frame.height * MAX_SIZE_TO_LINE_HEIGHT)
                 .coerceAtLeast(MIN_TEXT_SIZE)
-            val startSize = style.sizePx.coerceIn(MIN_TEXT_SIZE, sizeCeiling)
-            var naturalWidth = measureUnwrappedWidth(spannable, paint, startSize, style)
+            var size = baseSize.coerceIn(MIN_TEXT_SIZE, sizeCeiling)
+            var naturalWidth = measureUnwrappedWidth(spannable, paint, size, style)
             if (naturalWidth <= 0f) return
             if (naturalWidth < targetWidth && content.length > 1) {
                 // Short translations gain tracking first: widening the gaps
                 // keeps glyph shapes intact longer than stretching them does.
-                val extraEm = ((targetWidth - naturalWidth) / (content.length - 1)) / startSize
+                val extraEm = ((targetWidth - naturalWidth) / (content.length - 1)) / size
                 if (extraEm > MIN_TRACKING_INCREMENT) {
                     paint.letterSpacing = (paint.letterSpacing +
                         extraEm.coerceAtMost(MAX_EXTRA_TRACKING_EM))
                         .coerceAtMost(MAX_TOTAL_TRACKING_EM)
-                    naturalWidth = measureUnwrappedWidth(spannable, paint, startSize, style)
+                    naturalWidth = measureUnwrappedWidth(spannable, paint, size, style)
                 }
             }
-            val fill = (targetWidth / naturalWidth.coerceAtLeast(0.01f))
-                .coerceIn(MIN_WIDTH_FILL_SCALE, MAX_WIDTH_FILL_SCALE)
-            paint.textScaleX = (paint.textScaleX * fill)
-                .coerceIn(MIN_HORIZONTAL_SCALE, MAX_HORIZONTAL_SCALE)
-            layout = buildFittedLine(spannable, paint, style, alignment, targetWidth, startSize)
+            if (naturalWidth < targetWidth) {
+                val stretch = (targetWidth / naturalWidth.coerceAtLeast(0.01f))
+                    .coerceIn(1f, MAX_WIDTH_STRETCH_SCALE)
+                if (stretch > 1.001f) {
+                    paint.textScaleX = (paint.textScaleX * stretch)
+                        .coerceIn(MIN_HORIZONTAL_SCALE, MAX_HORIZONTAL_SCALE)
+                    naturalWidth = measureUnwrappedWidth(spannable, paint, size, style)
+                }
+            } else if (naturalWidth > targetWidth) {
+                // A long translation shrinks moderately before the glyphs are
+                // squeezed: a smaller optical size reads as the same typeface,
+                // a compressed one does not.
+                val required = (size * targetWidth / naturalWidth)
+                    .coerceAtLeast(size * MIN_FIT_SIZE_SCALE)
+                if (required < size - 0.05f) {
+                    size = required
+                    naturalWidth = measureUnwrappedWidth(spannable, paint, size, style)
+                }
+                if (naturalWidth > targetWidth && content.length > 1) {
+                    val deficitEm = ((naturalWidth - targetWidth) /
+                        (content.length - 1)) / size
+                    paint.letterSpacing = (paint.letterSpacing -
+                        deficitEm.coerceAtMost(MAX_TRACKING_COMPRESSION_EM))
+                        .coerceAtLeast(MIN_NEGATIVE_TRACKING_EM)
+                    naturalWidth = measureUnwrappedWidth(spannable, paint, size, style)
+                }
+                if (naturalWidth > targetWidth) {
+                    val condense = (targetWidth / naturalWidth)
+                        .coerceIn(MIN_WIDTH_CONDENSE_SCALE, 1f)
+                    paint.textScaleX = (paint.textScaleX * condense)
+                        .coerceIn(MIN_HORIZONTAL_SCALE, MAX_HORIZONTAL_SCALE)
+                    naturalWidth = measureUnwrappedWidth(spannable, paint, size, style)
+                }
+            }
+            layout = buildFittedLine(spannable, paint, style, alignment, targetWidth, size)
             drawLeft = horizontalOffset(
                 frame = frame,
                 layoutWidth = maxLineWidth(layout).coerceAtMost(targetWidth),
@@ -189,14 +243,40 @@ class TextRenderer @Inject constructor() {
             drawTop = frame.baseline - layout.getLineBaseline(0)
         } else {
             val targetWidth = bounds.width.roundToInt().coerceAtLeast(2)
-            val maxHeight = (bounds.height * MULTILINE_HEIGHT_SLACK)
-                .roundToInt().coerceAtLeast(2)
-            layout = fitLayout(spannable, paint, targetWidth, maxHeight, style, alignment)
+            val room = TextPlacement.room(
+                bounds = bounds,
+                obstacles = obstacles
+                    .filter { it.id != region.id }
+                    .map { it.bounds },
+                canvasHeight = imageHeight.toFloat(),
+            )
+            val gap = (baseSize * NEIGHBOUR_GAP_EM).coerceAtLeast(2f)
+            val placement = TextPlacement.window(
+                bounds = bounds,
+                room = room,
+                gap = gap,
+                maxGrowthRatio = MAX_NEIGHBOUR_GROWTH_RATIO,
+            )
+            layout = fitLayout(
+                text = spannable,
+                paint = paint,
+                maxWidth = targetWidth,
+                maxHeight = placement.maxHeight,
+                style = style,
+                alignment = alignment,
+                startSize = baseSize,
+                preferredLines = frames.size,
+            )
             drawLeft = bounds.left
-            val anchoredTop = frames.first().baseline - layout.getLineBaseline(0)
-            val maxBottom = bounds.bottom + bounds.height * MULTILINE_BOTTOM_SLACK
             drawTop = if (layout.lineCount >= 2) {
-                anchoredTop.coerceAtMost(maxBottom - layout.height)
+                TextPlacement.multilineTop(
+                    anchoredTop = frames.first().baseline - layout.getLineBaseline(0),
+                    layoutHeight = layout.height.toFloat(),
+                    layoutLines = layout.lineCount,
+                    sourceLines = frames.size,
+                    sourceHeight = bounds.height,
+                    window = placement,
+                )
             } else {
                 bounds.top + (bounds.height - layout.height) / 2f +
                     inkVerticalShift(layout, paint, spannable)
@@ -298,10 +378,30 @@ class TextRenderer @Inject constructor() {
                 right = bounds.right,
                 top = bounds.top,
                 bottom = bounds.bottom,
-                baseline = estimateBaseline(line, bounds),
+                baseline = estimateBaseline(
+                    line = line,
+                    bounds = bounds,
+                    capHeight = region.appearance?.capHeightPx,
+                ),
             )
         }
         return frames.ifEmpty { listOf(fallbackLineFrame(region.bounds)) }
+    }
+
+    /** Median baseline-to-baseline distance, used to keep the source line grid. */
+    private fun sourceLinePitch(region: TextRegionRecord): Float? {
+        val centers = region.lines
+            .mapNotNull { it.bounds }
+            .filter { it.height > 0f }
+            .sortedBy { it.top }
+            .map { (it.top + it.bottom) / 2f }
+        if (centers.size < 2) return null
+        val pitches = centers
+            .zipWithNext { first, second -> second - first }
+            .filter { it > 1f }
+            .sorted()
+        if (pitches.isEmpty()) return null
+        return pitches[pitches.size / 2]
     }
 
     private fun fallbackLineFrame(bounds: Bounds2D): SourceLineFrame = SourceLineFrame(
@@ -317,7 +417,11 @@ class TextRenderer @Inject constructor() {
      * those bottoms is stable even when the line also has g/p/y tails, which
      * a naive box-centre would drag downward.
      */
-    private fun estimateBaseline(line: TextLineRecord, bounds: Bounds2D): Float {
+    private fun estimateBaseline(
+        line: TextLineRecord,
+        bounds: Bounds2D,
+        capHeight: Float?,
+    ): Float {
         val units = line.elements.flatMap { element ->
             element.symbols.mapNotNull { symbol ->
                 symbol.bounds?.let { symbol.text to it }
@@ -334,9 +438,19 @@ class TextRenderer @Inject constructor() {
             units.any { (text, _) ->
                 text.firstOrNull { it.isLetterOrDigit() }?.let(::hasDescender) == true
             } -> bounds.bottom - bounds.height * DESCENDER_DEPTH_RATIO
+            // Some engines return line boxes without symbol boxes. Such a box
+            // may include the descender and leading, so its bottom is not the
+            // baseline; the measured cap height locates the baseline instead.
+            units.isEmpty() -> fallbackBaseline(bounds, capHeight)
             else -> bounds.bottom
         }
         return baseline.coerceIn(bounds.top, bounds.bottom)
+    }
+
+    private fun fallbackBaseline(bounds: Bounds2D, capHeight: Float?): Float {
+        val cap = capHeight?.takeIf { it.isFinite() && it > 1f } ?: return bounds.bottom
+        return (bounds.top + (bounds.height + cap) / 2f)
+            .coerceIn(bounds.top, bounds.bottom)
     }
 
     private fun hasDescender(character: Char): Boolean =
@@ -356,7 +470,15 @@ class TextRenderer @Inject constructor() {
         val columnHeight = bounds.height.roundToInt().coerceAtLeast(2)
         // Layout is built in transposed space: its width runs down the column.
         val spannable = buildSpannable(text, samples, style.color, transferScale = false)
-        val layout = fitLayout(spannable, paint, columnHeight, columnWidth, style, Layout.Alignment.ALIGN_NORMAL)
+        val layout = fitLayout(
+            text = spannable,
+            paint = paint,
+            maxWidth = columnHeight,
+            maxHeight = columnWidth,
+            style = style,
+            alignment = Layout.Alignment.ALIGN_NORMAL,
+            startSize = calibratedSize(style, paint),
+        )
         val usedLength = maxLineWidth(layout).coerceAtMost(columnHeight.toFloat())
 
         canvas.save()
@@ -438,7 +560,7 @@ class TextRenderer @Inject constructor() {
             Math.toRadians(abs(spanDegrees).toDouble()).toFloat()
         if (arcLength <= 1f) return
 
-        paint.textSize = style.sizePx.coerceIn(MIN_TEXT_SIZE, MAX_TEXT_SIZE)
+        paint.textSize = calibratedSize(style, paint).coerceIn(MIN_TEXT_SIZE, MAX_TEXT_SIZE)
         var widths = FloatArray(chars.length) { paint.measureText(chars[it].toString()) }
         var totalWidth = widths.sum()
         val targetArc = arcLength * CURVE_FILL_RATIO
@@ -494,15 +616,21 @@ class TextRenderer @Inject constructor() {
         maxHeight: Int,
         style: TextStyle,
         alignment: Layout.Alignment,
+        startSize: Float = style.sizePx,
+        preferredLines: Int? = null,
     ): StaticLayout {
         val maxSize = min(MAX_TEXT_SIZE, maxHeight * 1.7f + MIN_TEXT_SIZE)
-        val startSize = style.sizePx.coerceIn(MIN_TEXT_SIZE, maxSize)
-        var size = startSize
+        val start = startSize.coerceIn(MIN_TEXT_SIZE, maxSize)
+        var size = start
         var layout = buildLayout(text, paint, maxWidth, alignment, size, style)
-        if (fits(layout, maxWidth, maxHeight)) return layout
+        if (fits(layout, maxWidth, maxHeight)) {
+            return matchSourceLineCount(
+                layout, size, text, paint, maxWidth, maxHeight, style, alignment, preferredLines,
+            )
+        }
 
         var low = MIN_TEXT_SIZE
-        var high = startSize
+        var high = start
         var bestSize = -1f
         repeat(FIT_ITERATIONS) {
             val middle = (low + high) / 2f
@@ -527,7 +655,46 @@ class TextRenderer @Inject constructor() {
             return layout
         }
 
-        return buildLayout(text, paint, maxWidth, alignment, bestSize, style)
+        val fitted = buildLayout(text, paint, maxWidth, alignment, bestSize, style)
+        return matchSourceLineCount(
+            fitted, bestSize, text, paint, maxWidth, maxHeight, style, alignment, preferredLines,
+        )
+    }
+
+    /**
+     * When a translation wraps into more lines than the source, a slightly
+     * smaller optical size is preferred if it restores the original line count:
+     * the paragraph then occupies the same vertical rhythm as the original.
+     * The reduction is capped, so genuinely longer text still wraps.
+     */
+    private fun matchSourceLineCount(
+        layout: StaticLayout,
+        fittedSize: Float,
+        text: CharSequence,
+        paint: TextPaint,
+        maxWidth: Int,
+        maxHeight: Int,
+        style: TextStyle,
+        alignment: Layout.Alignment,
+        preferredLines: Int?,
+    ): StaticLayout {
+        if (preferredLines == null || preferredLines < 2 || layout.lineCount <= preferredLines) {
+            return layout
+        }
+        var low = fittedSize * MIN_LINE_COUNT_SIZE_SCALE
+        var high = fittedSize
+        var candidate: StaticLayout? = null
+        repeat(FIT_ITERATIONS) {
+            val middle = (low + high) / 2f
+            val trial = buildLayout(text, paint, maxWidth, alignment, middle, style)
+            if (trial.lineCount <= preferredLines && fits(trial, maxWidth, maxHeight)) {
+                candidate = trial
+                low = middle
+            } else {
+                high = middle
+            }
+        }
+        return candidate ?: layout
     }
 
     private fun buildLayout(
@@ -539,14 +706,39 @@ class TextRenderer @Inject constructor() {
         style: TextStyle,
     ): StaticLayout {
         paint.textSize = size
+        val (extraSpacing, multiplier) = lineSpacing(style, paint, size)
         return StaticLayout.Builder
             .obtain(text, 0, text.length, paint, width.coerceAtLeast(1))
             .setAlignment(alignment)
-            .setLineSpacing(0f, style.lineSpacingMultiplier.coerceIn(MIN_LINE_SPACING, MAX_LINE_SPACING))
+            .setLineSpacing(extraSpacing, multiplier)
             .setIncludePad(false)
             .setBreakStrategy(Layout.BREAK_STRATEGY_HIGH_QUALITY)
             .setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE)
             .build()
+    }
+
+    /**
+     * Keeps the measured source baseline pitch instead of trusting the chosen
+     * font's default leading. The pitch scales with the rendered optical size,
+     * so a shrunken translation keeps the original paragraph rhythm.
+     */
+    private fun lineSpacing(
+        style: TextStyle,
+        paint: TextPaint,
+        size: Float,
+    ): Pair<Float, Float> {
+        val multiplier = style.lineSpacingMultiplier.coerceIn(MIN_LINE_SPACING, MAX_LINE_SPACING)
+        val sourcePitch = style.linePitchPx
+            ?.takeIf { it.isFinite() && it > 1f }
+            ?: return 0f to multiplier
+        val targetPitch = sourcePitch * (size / style.sizePx.coerceAtLeast(1f))
+        val metrics = paint.fontMetrics
+        val natural = (metrics.descent - metrics.ascent + metrics.leading) * multiplier
+        val extra = (targetPitch - natural).coerceIn(
+            -targetPitch * MAX_LINE_SPACING_REDUCTION,
+            targetPitch * MAX_LINE_SPACING_ADDITION,
+        )
+        return extra to multiplier
     }
 
     private fun fits(layout: StaticLayout, maxWidth: Int, maxHeight: Int): Boolean =
@@ -581,6 +773,25 @@ class TextRenderer @Inject constructor() {
             if (width > widest) widest = width
         }
         return widest
+    }
+
+    /**
+     * Converts the measured cap height into an optical size for the chosen
+     * typeface. Families differ in cap-height/em ratio, so reusing the
+     * analyser's 0.72 constant would make the translation slightly too large
+     * or too small depending on the matched font.
+     */
+    private fun calibratedSize(style: TextStyle, paint: TextPaint): Float {
+        val capHeight = style.capHeightPx?.takeIf { it.isFinite() && it > 1f }
+            ?: return style.sizePx
+        paint.textSize = CAP_HEIGHT_PROBE_SIZE
+        val probe = Rect()
+        paint.getTextBounds(CAP_HEIGHT_PROBE, 0, CAP_HEIGHT_PROBE.length, probe)
+        val ratio = probe.height() / CAP_HEIGHT_PROBE_SIZE
+        if (ratio < MIN_CAP_HEIGHT_RATIO || ratio > MAX_CAP_HEIGHT_RATIO) {
+            return style.sizePx
+        }
+        return (capHeight / ratio).coerceIn(MIN_TEXT_SIZE, MAX_TEXT_SIZE)
     }
 
     private fun buildPaint(style: TextStyle): TextPaint {
@@ -620,9 +831,16 @@ class TextRenderer @Inject constructor() {
         val sourceRatio = (style.strokeWidthPx / capHeight)
             .takeIf { it.isFinite() }
             ?: return 0f
+        // A matched bold face already carries the weight. Only a clearly
+        // thicker source justifies an outline there; otherwise the glyphs gain
+        // a second boldness on top of the real one.
+        val trueBoldFace = style.fontWeight >= 600 &&
+            style.fontMatchScore >= MIN_FONT_MATCH_CONFIDENCE
         val delta = sourceRatio - expectedStrokeRatio(style.fontWeight)
-        if (delta <= MIN_STROKE_DELTA) return 0f
-        val maximum = (capHeight * MAX_SYNTHETIC_STROKE_RATIO).coerceAtLeast(MIN_SYNTHETIC_STROKE)
+        val tolerance = if (trueBoldFace) BOLD_FACE_STROKE_TOLERANCE else MIN_STROKE_DELTA
+        if (delta <= tolerance) return 0f
+        val maxRatio = if (trueBoldFace) MAX_BOLD_FACE_STROKE_RATIO else MAX_SYNTHETIC_STROKE_RATIO
+        val maximum = (capHeight * maxRatio).coerceAtLeast(MIN_SYNTHETIC_STROKE)
         return (delta * capHeight).coerceIn(MIN_SYNTHETIC_STROKE, maximum)
     }
 
@@ -673,6 +891,19 @@ class TextRenderer @Inject constructor() {
     ): CharSequence {
         if (text.isEmpty() || samples.isEmpty()) return text
         val builder = SpannableStringBuilder(text)
+        val accent = accentPrefixColor(samples, fallback)
+        if (accent != null) {
+            val end = firstTokenEnd(text)
+            if (end > 0) {
+                builder.setSpan(
+                    ForegroundColorSpan(accent),
+                    0,
+                    end,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+                )
+                return builder
+            }
+        }
         if (samples.size == 1) {
             val color = samples.first().color
             if (color != null && color != fallback) {
@@ -720,6 +951,44 @@ class TextRenderer @Inject constructor() {
         return builder
     }
 
+    /**
+     * A leading coloured word ("ВАЖНО:") marks the paragraph accent and the
+     * translation starts with its equivalent. Mapping that colour by raw
+     * character position would tint only a few letters of a longer paragraph,
+     * so the whole first word inherits it instead.
+     */
+    private fun accentPrefixColor(samples: List<TextStyleSample>, fallback: Int): Int? {
+        if (samples.size < MIN_ACCENT_SAMPLES) return null
+        val first = samples.first().color ?: return null
+        if (colorDisparity(first, fallback) < MIN_ACCENT_DISPARITY) return null
+        val limit = (samples.size * MAX_ACCENT_PREFIX_SHARE).toInt().coerceAtLeast(1)
+        var lastAccent = 0
+        for (index in 1..limit.coerceAtMost(samples.lastIndex)) {
+            val color = samples[index].color ?: break
+            if (colorDisparity(color, first) > MAX_ACCENT_RUN_DISPARITY) break
+            lastAccent = index
+        }
+        if (lastAccent < 1 || lastAccent >= limit) return null
+        val rest = samples.drop(lastAccent + 1).mapNotNull { it.color }
+        if (rest.isEmpty()) return null
+        val bodyMatches = rest.count { colorDisparity(it, fallback) <= MIN_ACCENT_DISPARITY }
+        if (bodyMatches.toFloat() / rest.size < MIN_ACCENT_BODY_SHARE) return null
+        return first
+    }
+
+    private fun firstTokenEnd(text: String): Int {
+        val end = text.indexOfFirst { it.isWhitespace() }
+        return if (end < 0) text.length else end
+    }
+
+    private fun colorDisparity(first: Int, second: Int): Int {
+        val alpha = abs(((first ushr 24) and 0xFF) - ((second ushr 24) and 0xFF))
+        val red = abs(((first shr 16) and 0xFF) - ((second shr 16) and 0xFF))
+        val green = abs(((first shr 8) and 0xFF) - ((second shr 8) and 0xFF))
+        val blue = abs((first and 0xFF) - (second and 0xFF))
+        return alpha + red + green + blue
+    }
+
     private fun positionOf(index: Int, length: Int): Float =
         if (length <= 1) 0f else index.toFloat() / (length - 1)
 
@@ -741,6 +1010,14 @@ class TextRenderer @Inject constructor() {
         const val MIN_STROKE_DELTA = 0.012f
         const val MIN_SYNTHETIC_STROKE = 0.35f
         const val MAX_SYNTHETIC_STROKE_RATIO = 0.22f
+        const val MIN_FONT_MATCH_CONFIDENCE = 0.35f
+        const val BOLD_FACE_STROKE_TOLERANCE = 0.035f
+        const val MAX_BOLD_FACE_STROKE_RATIO = 0.05f
+        const val MIN_ACCENT_SAMPLES = 8
+        const val MAX_ACCENT_PREFIX_SHARE = 0.2f
+        const val MIN_ACCENT_DISPARITY = 140
+        const val MAX_ACCENT_RUN_DISPARITY = 90
+        const val MIN_ACCENT_BODY_SHARE = 0.6f
         const val MIN_ROTATION_DEGREES = 0.75f
         const val FIT_ITERATIONS = 10
         const val MIN_CURVE_SPAN_DEGREES = 8f
@@ -752,13 +1029,23 @@ class TextRenderer @Inject constructor() {
         const val MAX_SIZE_TO_LINE_HEIGHT = 1.8f
         const val FALLBACK_BASELINE_RATIO = 0.82f
         const val DESCENDER_DEPTH_RATIO = 0.17f
-        const val MIN_WIDTH_FILL_SCALE = 0.62f
-        const val MAX_WIDTH_FILL_SCALE = 1.28f
         const val MAX_EXTRA_TRACKING_EM = 0.18f
         const val MAX_TOTAL_TRACKING_EM = 0.4f
+        const val MAX_TRACKING_COMPRESSION_EM = 0.05f
+        const val MIN_NEGATIVE_TRACKING_EM = -0.05f
         const val MIN_TRACKING_INCREMENT = 0.01f
-        const val MULTILINE_HEIGHT_SLACK = 1.35f
-        const val MULTILINE_BOTTOM_SLACK = 0.15f
+        const val MAX_WIDTH_STRETCH_SCALE = 1.08f
+        const val MIN_WIDTH_CONDENSE_SCALE = 0.86f
+        const val MIN_FIT_SIZE_SCALE = 0.82f
+        const val MIN_LINE_COUNT_SIZE_SCALE = 0.86f
+        const val MAX_NEIGHBOUR_GROWTH_RATIO = 0.45f
+        const val NEIGHBOUR_GAP_EM = 0.08f
+        const val MAX_LINE_SPACING_REDUCTION = 0.35f
+        const val MAX_LINE_SPACING_ADDITION = 0.8f
+        const val CAP_HEIGHT_PROBE = "H"
+        const val CAP_HEIGHT_PROBE_SIZE = 128f
+        const val MIN_CAP_HEIGHT_RATIO = 0.45f
+        const val MAX_CAP_HEIGHT_RATIO = 0.95f
         const val MIN_RENDERED_SCALE_STEP = 0.015f
 
         private val DESCENDER_CHARS = setOf(

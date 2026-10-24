@@ -47,6 +47,8 @@ data class TextStyle(
     /** Key of the matched font in FontCatalog (system family + weight). */
     val fontKey: String = "",
     val fontMatchScore: Float = 0f,
+    /** Measured distance between source baselines, in pixels. */
+    val linePitchPx: Float? = null,
 )
 
 /**

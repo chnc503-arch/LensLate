@@ -76,7 +76,8 @@ class StyleAnalyzer @Inject constructor() {
         val capHeight = estimateCapHeight(region, lineBoxes, height)
         val sizePx = (capHeight / CAP_HEIGHT_RATIO).coerceIn(MIN_FONT_SIZE, MAX_FONT_SIZE)
         val strokeWidth = estimateStrokeWidth(mask, width, height, capHeight)
-        val weight = estimateWeight(strokeWidth, capHeight, mask, width, height, lineBoxes)
+        val density = estimateInkDensity(mask, width, height, lineBoxes)
+        val weight = estimateWeight(strokeWidth, capHeight, density)
         val mono = estimateMono(region, sizePx)
         val alignment = estimateAlignment(region)
         val slant = estimateSlant(mask, width, height, lineBoxes)
@@ -98,6 +99,7 @@ class StyleAnalyzer @Inject constructor() {
             weightHint = weight,
             underlined = underlined,
             struckThrough = struckThrough,
+            italicHint = slant >= MIN_ITALIC_SLANT,
         )
         val variant = fontMatch?.variant
         val fontFamily = variant?.fontClass ?: if (mono) "monospace" else "sans"
@@ -105,6 +107,14 @@ class StyleAnalyzer @Inject constructor() {
         val isMono = variant?.fontClass == "monospace" || (variant == null && mono)
         val italic = variant?.italic == true
         val fontKey = variant?.key ?: FontCatalog.fallbackKey(fontFamily, fontWeight, weight >= 600)
+        android.util.Log.d(
+            "LensLateStyle",
+            "«${region.text.replace('\n', ' ').take(24)}» cap=${"%.1f".format(capHeight)} " +
+                "stroke=${"%.2f".format(strokeWidth)} w=$weight sl=${"%.1f".format(slant)} " +
+                "font=$fontKey score=${"%.2f".format(fontMatch?.score ?: 0f)} " +
+                "mix=${"%.2f".format(letterSpacing)} line=${"%.2f".format(lineSpacing)} " +
+                "dens=${"%.2f".format(density)} mono=$mono",
+        )
 
         val style = TextStyle(
             color = inkColor,
@@ -170,28 +180,31 @@ class StyleAnalyzer @Inject constructor() {
         background: Int,
         fallbackColor: Int,
     ): List<TextStyleSample> {
-        val units = collectInkUnits(region)
-        if (units.isEmpty()) return emptyList()
-        val scales = sizeTrend(units)
-        return units.mapIndexed { index, unit ->
-            TextStyleSample(
-                color = sampleUnitColor(bitmap, unit.bounds, background, fallbackColor),
-                scale = scales[index],
-            )
+        if (region.lines.isEmpty()) return emptyList()
+        return region.lines.flatMap { line ->
+            val units = collectInkUnits(line)
+            if (units.isEmpty()) return@flatMap emptyList()
+            // A trend measured across a whole paragraph would read line breaks
+            // as a size drift; every line is normalised on its own.
+            val scales = sizeTrend(units)
+            units.mapIndexed { index, unit ->
+                TextStyleSample(
+                    color = sampleUnitColor(bitmap, unit.bounds, background, fallbackColor),
+                    scale = scales[index],
+                )
+            }
         }
     }
 
-    private fun collectInkUnits(region: TextRegionRecord): List<InkUnit> {
-        val symbols = region.lines
-            .flatMap { it.elements }
+    private fun collectInkUnits(line: TextLineRecord): List<InkUnit> {
+        val symbols = line.elements
             .flatMap { it.symbols }
             .mapNotNull { symbol ->
                 val bounds = symbol.bounds ?: return@mapNotNull null
                 if (symbol.text.isBlank()) null else InkUnit(symbol.text, bounds)
             }
         if (symbols.size >= 2) return symbols
-        val elements = region.lines
-            .flatMap { it.elements }
+        val elements = line.elements
             .mapNotNull { element ->
                 val bounds = element.bounds ?: return@mapNotNull null
                 if (element.text.isBlank()) null else InkUnit(element.text, bounds)
@@ -327,6 +340,7 @@ class StyleAnalyzer @Inject constructor() {
         weightHint: Int,
         underlined: Boolean,
         struckThrough: Boolean,
+        italicHint: Boolean,
     ): FontMatch? {
         if (region.isVertical || region.isCurved) return null
         if (capHeight < MIN_FONT_MATCH_CAP_HEIGHT || maskWidth < 8 || maskHeight < 6) return null
@@ -337,27 +351,36 @@ class StyleAnalyzer @Inject constructor() {
             if (letters < MIN_FONT_MATCH_LETTERS) return@mapNotNull null
             line to letters
         }
-        val representative = candidates.maxWithOrNull(
-            compareBy<Pair<TextLineRecord, Int>> { it.second }
-                .thenBy { it.first.bounds?.width ?: 0f },
-        ) ?: return null
-        val line = representative.first
-        val lineRect = line.bounds?.toRect() ?: return null
-        return runCatching {
-            FontMatcher.match(
-                text = line.text,
-                mask = mask,
-                maskWidth = maskWidth,
-                maskHeight = maskHeight,
-                regionRect = regionRect,
-                lineRect = lineRect,
-                capHeight = capHeight,
-                letterSpacingPx = letterSpacingPx,
-                weightHint = weightHint,
-                underlined = underlined,
-                struckThrough = struckThrough,
-            )
-        }.getOrNull()
+        // Very long lines accumulate OCR differences, and every misplaced glyph
+        // lowers the overlap for all fonts equally. A mid-length line keeps the
+        // serif/weight differences dominant, and a second attempt hedges
+        // against one badly recognised line.
+        val ranked = candidates.sortedWith(
+            compareBy<Pair<TextLineRecord, Int>> { abs(it.second - REPRESENTATIVE_LETTERS) }
+                .thenByDescending { it.first.bounds?.width ?: 0f },
+        )
+        var best: FontMatch? = null
+        ranked.take(REPRESENTATIVE_ATTEMPTS).forEach { (line, _) ->
+            val lineRect = line.bounds?.toRect() ?: return@forEach
+            val match = runCatching {
+                FontMatcher.match(
+                    text = line.text,
+                    mask = mask,
+                    maskWidth = maskWidth,
+                    maskHeight = maskHeight,
+                    regionRect = regionRect,
+                    lineRect = lineRect,
+                    capHeight = capHeight,
+                    letterSpacingPx = letterSpacingPx,
+                    weightHint = weightHint,
+                    underlined = underlined,
+                    struckThrough = struckThrough,
+                    italicHint = italicHint,
+                )
+            }.getOrNull() ?: return@forEach
+            if (best == null || match.score > best!!.score) best = match
+        }
+        return best
     }
 
     private fun estimateBackgroundColor(bitmap: Bitmap, rect: Rect): Int {
@@ -512,46 +535,52 @@ class StyleAnalyzer @Inject constructor() {
         return values.sorted()[values.size / 2]
     }
 
+    /**
+     * Median vertical run through the ink mask. Scanning columns crosses
+     * vertical stems at their true width, while the old horizontal scan also
+     * measured the long horizontal bars of serifs and capitals, which
+     * inflated regular serif print into a false bold.
+     */
     private fun estimateStrokeWidth(
         mask: BooleanArray,
         width: Int,
         height: Int,
         capHeight: Float,
     ): Float {
-        val maxRun = (capHeight * MAX_STROKE_RUN_RATIO).coerceAtLeast(5f)
+        val maxRun = (capHeight * MAX_STROKE_RUN_RATIO).coerceAtLeast(5f).toInt()
         val runs = ArrayList<Int>()
-        for (y in 0 until height) {
+        for (x in 0 until width) {
             var run = 0
-            val row = y * width
-            for (x in 0 until width) {
-                if (mask[row + x]) {
+            for (y in 0 until height) {
+                if (mask[y * width + x]) {
                     run++
                 } else {
-                    if (run in 1..maxRun.toInt()) runs += run
+                    if (run in 1..maxRun) runs += run
                     run = 0
                 }
             }
-            if (run in 1..maxRun.toInt()) runs += run
+            if (run in 1..maxRun) runs += run
         }
         if (runs.isEmpty()) return (capHeight * DEFAULT_STROKE_RATIO).coerceAtLeast(1f)
         runs.sort()
         val median = runs[runs.size / 2].toFloat()
+        // The ink mask already trims faint edges, but the remaining anti-
+        // aliasing still adds a fraction of a pixel to every run. At small
+        // point sizes that fraction is large enough to turn regular print into
+        // a false bold, so the bias is removed before the ratio is computed.
+        val corrected = (median - STROKE_ANTIALIAS_SLACK).coerceAtLeast(MIN_STROKE_PX)
         // Cap height can be as small as 1 px on degenerate regions; the upper
         // bound must never fall below the lower one.
-        val maximum = (capHeight * 0.32f).coerceAtLeast(0.75f)
-        return median.coerceIn(0.75f, maximum)
+        val maximum = (capHeight * 0.32f).coerceAtLeast(MIN_STROKE_PX)
+        return corrected.coerceIn(MIN_STROKE_PX, maximum)
     }
 
-    private fun estimateWeight(
-        strokeWidth: Float,
-        capHeight: Float,
+    private fun estimateInkDensity(
         mask: BooleanArray,
         width: Int,
         height: Int,
         lineBoxes: List<Rect>,
-    ): Int {
-        if (capHeight <= 0f) return 400
-        val ratio = strokeWidth / capHeight
+    ): Float {
         var ink = 0
         var area = 0
         lineBoxes.forEach { line ->
@@ -567,10 +596,19 @@ class StyleAnalyzer @Inject constructor() {
                 }
             }
         }
-        val density = if (area > 0) ink.toFloat() / area else 0f
+        return if (area > 0) ink.toFloat() / area else 0f
+    }
+
+    private fun estimateWeight(
+        strokeWidth: Float,
+        capHeight: Float,
+        density: Float,
+    ): Int {
+        if (capHeight <= 0f) return 400
+        val ratio = strokeWidth / capHeight
         return when {
-            ratio >= 0.155f || density >= 0.34f -> 700
-            ratio >= 0.125f || density >= 0.28f -> 600
+            ratio >= 0.155f || density >= 0.38f -> 700
+            ratio >= 0.125f || density >= 0.31f -> 600
             ratio >= 0.10f -> 500
             ratio >= 0.075f -> 400
             else -> 300
@@ -657,6 +695,8 @@ class StyleAnalyzer @Inject constructor() {
         if (slopes.isEmpty()) return 0f
         val slope = slopes.sorted()[slopes.size / 2]
         val degrees = Math.toDegrees(atan(slope.toDouble())).toFloat().coerceIn(-MAX_SLANT, MAX_SLANT)
+        // A real italic leans by eight degrees or more; tiny centroid drifts on
+        // short lines are noise and used to italicise upright subtitles.
         return if (abs(degrees) < MIN_SLANT_DEGREES) 0f else degrees
     }
 
@@ -851,17 +891,22 @@ class StyleAnalyzer @Inject constructor() {
         const val MIN_CHARACTER_ALPHA = 40
         const val MIN_FONT_MATCH_CAP_HEIGHT = 4f
         const val MIN_FONT_MATCH_LETTERS = 2
+        const val REPRESENTATIVE_LETTERS = 26
+        const val REPRESENTATIVE_ATTEMPTS = 2
         const val MAX_COLOR_SAMPLES = 90_000
         const val BACKGROUND_SAMPLE_PADDING = 0.18f
         const val MIN_BACKGROUND_MODE_SHARE = 0.28f
         const val MAX_STROKE_RUN_RATIO = 0.65f
         const val DEFAULT_STROKE_RATIO = 0.09f
+        const val STROKE_ANTIALIAS_SLACK = 0.4f
+        const val MIN_STROKE_PX = 0.6f
         const val MIN_MONO_SYMBOLS = 5
         const val MAX_MONO_WIDTH_VARIATION = 0.24f
         const val MAX_ALIGNMENT_SPREAD = 0.35f
         const val MIN_SLANT_ROW_PIXELS = 3
         const val MIN_SLANT_ROWS = 6
-        const val MIN_SLANT_DEGREES = 1.2f
+        const val MIN_SLANT_DEGREES = 2.2f
+        const val MIN_ITALIC_SLANT = 4f
         const val MAX_SLANT = 30f
         const val MIN_SPACING_SAMPLES = 3
         const val SANS_NATURAL_GAP_RATIO = 0.06f

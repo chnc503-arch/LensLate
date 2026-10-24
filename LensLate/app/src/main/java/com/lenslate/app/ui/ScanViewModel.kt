@@ -620,7 +620,11 @@ class ScanViewModel @Inject constructor(
                 val renderStarted = SystemClock.elapsedRealtime()
                 val rendered = withContext(Dispatchers.Default) {
                     if (replaceable.isEmpty()) bitmap
-                    else textRenderer.render(restored, replaceable)
+                    else textRenderer.render(
+                        restored,
+                        replaceable,
+                        translatedDocument.regions,
+                    )
                 }
                 ensureActive()
                 val renderMs = SystemClock.elapsedRealtime() - renderStarted
