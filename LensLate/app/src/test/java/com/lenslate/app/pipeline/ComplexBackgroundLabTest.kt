@@ -42,6 +42,87 @@ class ComplexBackgroundLabTest {
         assertTrue("gradient collapsed to $distinct colours", distinct >= 6)
     }
 
+    @Test
+    fun narrowAntiAliasedGlyphsKeepTheirGradient() {
+        // Body text has 2 px stems: most of a glyph is anti-aliased edge, and a
+        // single sampled colour per glyph must still follow the ink gradient.
+        val boxes = (0 until THIN_COUNT).map { index ->
+            val left = THIN_LEFT + index * THIN_STEP
+            Box(left, THIN_TOP, left + THIN_WIDTH, THIN_TOP + THIN_HEIGHT)
+        }
+        val firstCenter = (boxes.first().left + boxes.first().right) / 2f
+        val lastCenter = (boxes.last().left + boxes.last().right) / 2f
+        val expected = boxes.map { box ->
+            val center = (box.left + box.right) / 2f
+            StyleGradient.lerpColor(WARM_INK, COLD_INK, (center - firstCenter) / (lastCenter - firstCenter))
+        }
+        val pixels = paintThinPage(boxes, expected)
+        val sampled = boxes.map { box ->
+            sampleGlyph(
+                pixels = pixels,
+                pageWidth = THIN_WIDTH_PAGE,
+                pageHeight = THIN_HEIGHT_PAGE,
+                left = box.left,
+                top = box.top,
+                right = box.right,
+                bottom = box.bottom,
+                nominalInk = MID_INK,
+                globalBackground = pixels[THIN_WIDTH_PAGE * 4 + 4],
+            )
+        }
+
+        assertTrue("first thin glyph is not warm: ${sampled.first().toHex()}", red(sampled.first()) - blue(sampled.first()) > 20)
+        assertTrue("last thin glyph is not cool: ${sampled.last().toHex()}", blue(sampled.last()) - red(sampled.last()) > 20)
+        sampled.zipWithNext().forEach { (left, right) ->
+            assertTrue(
+                "red channel rises inside the gradient: ${left.toHex()} -> ${right.toHex()}",
+                red(right) <= red(left) + 6,
+            )
+        }
+        sampled.forEachIndexed { index, color ->
+            assertColorNear(expected[index], color, tolerance = 26)
+        }
+        val distinct = sampled.map(::quantized).toSet().size
+        assertTrue("thin gradient collapsed to $distinct colours", distinct >= 5)
+    }
+
+    private fun paintThinPage(boxes: List<Box>, inkColors: List<Int>): IntArray {
+        val pixels = IntArray(THIN_WIDTH_PAGE * THIN_HEIGHT_PAGE)
+        val random = Random(THIN_SEED)
+        for (y in 0 until THIN_HEIGHT_PAGE) {
+            val t = y.toFloat() / (THIN_HEIGHT_PAGE - 1)
+            for (x in 0 until THIN_WIDTH_PAGE) {
+                val grain = random.nextInt(9) - 4
+                val stripe = (sin(x * 0.07 + y * 0.11) * 7).roundToInt()
+                val red = (42 + 48 * t + grain + stripe).roundToInt().coerceIn(0, 255)
+                val green = (30 + 44 * t + grain + stripe / 2).roundToInt().coerceIn(0, 255)
+                val blue = (58 + 26 * t + grain).roundToInt().coerceIn(0, 255)
+                pixels[y * THIN_WIDTH_PAGE + x] = argb(255, red, green, blue)
+            }
+        }
+        boxes.forEachIndexed { index, box ->
+            val ink = inkColors[index]
+            for (y in box.top until box.bottom) {
+                for (x in box.left until box.right) {
+                    val coverage = thinCoverage(box, x)
+                    if (coverage <= 0f) continue
+                    pixels[y * THIN_WIDTH_PAGE + x] = StyleGradient.lerpColor(
+                        pixels[y * THIN_WIDTH_PAGE + x],
+                        ink,
+                        coverage,
+                    )
+                }
+            }
+        }
+        return pixels
+    }
+
+    private fun thinCoverage(box: Box, x: Int): Float = when (x - box.left) {
+        1, 2, 6, 7 -> 1f
+        0, 3, 5, 8 -> 0.45f
+        else -> 0f
+    }
+
     private fun buildPage(): Page {
         val bars = (0 until BAR_COUNT).map { index ->
             val left = BAR_LEFT + index * BAR_STEP
@@ -128,36 +209,17 @@ class ComplexBackgroundLabTest {
         val expected: List<Int>,
         val midInk: Int,
     ) {
-        fun sample(box: Box, nominalInk: Int): Int {
-            val pad = ((box.bottom - box.top) * 0.30f).roundToInt().coerceIn(3, 10)
-            val left = box.left.coerceIn(0, width - 1)
-            val right = box.right.coerceIn(left + 1, width)
-            val top = (box.top - pad).coerceIn(0, height - 1)
-            val bottom = (box.bottom + pad).coerceIn(top + 1, height)
-            val glyphTop = box.top.coerceIn(top, bottom - 1) - top
-            val glyphBottom = box.bottom.coerceIn(top + 1, bottom) - top
-            val sampleWidth = right - left
-            val sampleHeight = bottom - top
-            val crop = IntArray(sampleWidth * sampleHeight)
-            for (row in 0 until sampleHeight) {
-                val source = (top + row) * width + left
-                System.arraycopy(pixels, source, crop, row * sampleWidth, sampleWidth)
-            }
-            val backdrop = InkColorSampler.estimateBackdrop(
-                topStrip = crop.copyOfRange(0, glyphTop * sampleWidth),
-                bottomStrip = crop.copyOfRange(glyphBottom * sampleWidth, crop.size),
-                globalBackground = pixels[CORNER_SAMPLE_ROW * width + CORNER_SAMPLE_COLUMN],
-                inkColor = nominalInk,
-            )
-            return InkColorSampler.sampleGlyphColor(
-                pixels = crop,
-                width = sampleWidth,
-                glyphTop = glyphTop,
-                glyphBottom = glyphBottom,
-                backdrop = backdrop,
-                fallbackInk = nominalInk,
-            )
-        }
+        fun sample(box: Box, nominalInk: Int): Int = sampleGlyph(
+            pixels = pixels,
+            pageWidth = width,
+            pageHeight = height,
+            left = box.left,
+            top = box.top,
+            right = box.right,
+            bottom = box.bottom,
+            nominalInk = nominalInk,
+            globalBackground = pixels[CORNER_SAMPLE_ROW * width + CORNER_SAMPLE_COLUMN],
+        )
     }
 
     private data class Box(val left: Int, val top: Int, val right: Int, val bottom: Int)
@@ -205,7 +267,58 @@ class ComplexBackgroundLabTest {
         const val GLOW_GREEN = 172
         const val GLOW_BLUE = 120
         const val SEED = 11L
+        const val THIN_WIDTH_PAGE = 320
+        const val THIN_HEIGHT_PAGE = 72
+        const val THIN_COUNT = 6
+        const val THIN_LEFT = 20
+        const val THIN_STEP = 48
+        const val THIN_WIDTH = 9
+        const val THIN_TOP = 26
+        const val THIN_HEIGHT = 20
+        const val THIN_SEED = 29L
         val WARM_INK = 0xFFEB283C.toInt()
         val COLD_INK = 0xFF2855FF.toInt()
+        val MID_INK = 0xFFA03D8F.toInt()
     }
+}
+
+private fun sampleGlyph(
+    pixels: IntArray,
+    pageWidth: Int,
+    pageHeight: Int,
+    left: Int,
+    top: Int,
+    right: Int,
+    bottom: Int,
+    nominalInk: Int,
+    globalBackground: Int,
+): Int {
+    val pad = ((bottom - top) * 0.30f).roundToInt().coerceIn(3, 10)
+    val sampleLeft = left.coerceIn(0, pageWidth - 1)
+    val sampleRight = right.coerceIn(sampleLeft + 1, pageWidth)
+    val sampleTop = (top - pad).coerceIn(0, pageHeight - 1)
+    val sampleBottom = (bottom + pad).coerceIn(sampleTop + 1, pageHeight)
+    val glyphTop = top.coerceIn(sampleTop, sampleBottom - 1) - sampleTop
+    val glyphBottom = bottom.coerceIn(sampleTop + 1, sampleBottom) - sampleTop
+    val sampleWidth = sampleRight - sampleLeft
+    val sampleHeight = sampleBottom - sampleTop
+    val crop = IntArray(sampleWidth * sampleHeight)
+    for (row in 0 until sampleHeight) {
+        val source = (sampleTop + row) * pageWidth + sampleLeft
+        System.arraycopy(pixels, source, crop, row * sampleWidth, sampleWidth)
+    }
+    val backdrop = InkColorSampler.estimateBackdrop(
+        topStrip = crop.copyOfRange(0, glyphTop * sampleWidth),
+        bottomStrip = crop.copyOfRange(glyphBottom * sampleWidth, crop.size),
+        globalBackground = globalBackground,
+        inkColor = nominalInk,
+    )
+    return InkColorSampler.sampleGlyphColor(
+        pixels = crop,
+        width = sampleWidth,
+        glyphTop = glyphTop,
+        glyphBottom = glyphBottom,
+        backdrop = backdrop,
+        fallbackInk = nominalInk,
+    )
 }
