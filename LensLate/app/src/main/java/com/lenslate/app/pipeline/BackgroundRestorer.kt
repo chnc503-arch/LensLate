@@ -100,97 +100,155 @@ class BackgroundRestorer @Inject constructor() {
         val allowed = BooleanArray(pixels.size) { index -> (pixels[index] ushr 24) > 8 }
         if (allowed.none { it }) return allowed
 
-        val refined = BooleanArray(pixels.size)
+        val result = BooleanArray(pixels.size)
+        var producedInk = false
         regions.forEach { region ->
-            refineRegionInk(source, region, allowed, refined)
+            if (buildRegionMask(source, region, allowed, result, width, height)) {
+                producedInk = true
+            }
         }
-        if (refined.none { it }) {
+        if (!producedInk) {
             return dilate(allowed, width, height, MASK_DILATION)
         }
-        return dilate(refined, width, height, MASK_DILATION)
+        return result
     }
 
     /**
-     * Keeps only pixels that look like this region's ink. Pixels that are close
-     * to the local background stay untouched, which is what preserves letter
-     * counters, gaps and noisy paper texture inside OCR boxes.
+     * Classifies one region's ink and dilates the mask by the width of the
+     * region's own ink halo, so blurred glyphs are erased together with their
+     * soft edge instead of leaving a coloured silhouette behind.
      */
-    private fun refineRegionInk(
+    private fun buildRegionMask(
         source: Bitmap,
         region: TextRegionRecord,
         allowed: BooleanArray,
-        output: BooleanArray,
-    ) {
-        val width = source.width
-        val height = source.height
+        result: BooleanArray,
+        width: Int,
+        height: Int,
+    ): Boolean {
         val rect = Rect(
             region.bounds.left.toInt().coerceIn(0, width - 1),
             region.bounds.top.toInt().coerceIn(0, height - 1),
             region.bounds.right.toInt().coerceIn(1, width),
             region.bounds.bottom.toInt().coerceIn(1, height),
         )
-        if (rect.width() < 2 || rect.height() < 2) return
+        if (rect.width() < 2 || rect.height() < 2) return false
+
+        val cropLeft = (rect.left - TextEdgeProfile.MAX_DILATION).coerceAtLeast(0)
+        val cropTop = (rect.top - TextEdgeProfile.MAX_DILATION).coerceAtLeast(0)
+        val cropRight = (rect.right + TextEdgeProfile.MAX_DILATION).coerceAtMost(width)
+        val cropBottom = (rect.bottom + TextEdgeProfile.MAX_DILATION).coerceAtMost(height)
+        val cropWidth = cropRight - cropLeft
+        val cropHeight = cropBottom - cropTop
+        if (cropWidth < 2 || cropHeight < 2) return false
+
+        val crop = IntArray(cropWidth * cropHeight)
+        try {
+            source.getPixels(crop, 0, cropWidth, cropLeft, cropTop, cropWidth, cropHeight)
+        } catch (_: IllegalArgumentException) {
+            return false
+        }
 
         val background = region.appearance?.localBackgroundArgb
             ?.takeIf { Color.alpha(it) >= MIN_REFERENCE_ALPHA }
             ?: estimateRegionBackground(source, rect)
         val references = inkReferences(region, background)
         val maxContrast = references.maxOfOrNull { colorDistanceSq(it, background) } ?: 0f
-        if (references.isEmpty() || maxContrast < MIN_CLASSIFIABLE_CONTRAST_SQ) {
-            copyAllowed(rect, width, allowed, output)
-            return
-        }
 
-        val thresholdSq = (maxContrast * EDGE_INK_SHARE).coerceIn(MIN_EDGE_THRESHOLD_SQ, MAX_EDGE_THRESHOLD_SQ)
-        val strongSq = (maxContrast * STRONG_INK_SHARE).coerceIn(MIN_STRONG_THRESHOLD_SQ, MAX_STRONG_THRESHOLD_SQ)
-        val crop = IntArray(rect.width() * rect.height())
-        try {
-            source.getPixels(crop, 0, rect.width(), rect.left, rect.top, rect.width(), rect.height())
-        } catch (_: IllegalArgumentException) {
-            copyAllowed(rect, width, allowed, output)
-            return
-        }
-
+        val localAllowed = BooleanArray(crop.size)
+        val distances = FloatArray(crop.size)
         var allowedCount = 0
+        for (y in 0 until cropHeight) {
+            val cropRow = y * cropWidth
+            val globalRow = (cropTop + y) * width
+            for (x in 0 until cropWidth) {
+                val cropIndex = cropRow + x
+                val globalIndex = globalRow + cropLeft + x
+                val isAllowed = allowed[globalIndex]
+                localAllowed[cropIndex] = isAllowed
+                val distance = colorDistanceSq(crop[cropIndex], background)
+                distances[cropIndex] = distance
+                if (isAllowed) allowedCount++
+            }
+        }
+
+        val edgeWidth = TextEdgeProfile.medianEdgeWidth(
+            distances, localAllowed, cropWidth, cropHeight, maxContrast,
+        )
+        val dilationRadius = TextEdgeProfile.dilationRadius(edgeWidth)
+
+        val mask = BooleanArray(crop.size)
         var inkCount = 0
-        for (y in 0 until rect.height()) {
-            val row = (rect.top + y) * width
-            val cropRow = y * rect.width()
-            for (x in 0 until rect.width()) {
-                val index = row + rect.left + x
-                if (!allowed[index]) continue
-                allowedCount++
-                val pixel = crop[cropRow + x]
-                val backgroundDistance = colorDistanceSq(pixel, background)
+        if (references.isNotEmpty() && maxContrast < FULL_BLOCK_ERASE_CONTRAST_SQ) {
+            // The ink is only a few levels away from the texture, so colour
+            // separation latches onto background noise and leaves the glyph
+            // edges behind. Erase the whole block instead and let texture
+            // synthesis rebuild it, so no original letters stay under the
+            // translation.
+            val left = (rect.left - cropLeft - dilationRadius).coerceAtLeast(0)
+            val top = (rect.top - cropTop - dilationRadius).coerceAtLeast(0)
+            val right = (rect.right - cropLeft + dilationRadius).coerceAtMost(cropWidth)
+            val bottom = (rect.bottom - cropTop + dilationRadius).coerceAtMost(cropHeight)
+            if (right <= left || bottom <= top) return false
+            for (y in top until bottom) {
+                val row = y * cropWidth
+                val globalRow = (cropTop + y) * width
+                for (x in left until right) {
+                    mask[row + x] = true
+                    result[globalRow + cropLeft + x] = true
+                    inkCount++
+                }
+            }
+            return inkCount > 0
+        }
+        if (references.isEmpty() || maxContrast < MIN_CLASSIFIABLE_CONTRAST_SQ) {
+            copyAllowed(localAllowed, mask)
+            inkCount = allowedCount
+        } else {
+            val thresholdSq = (maxContrast * EDGE_INK_SHARE)
+                .coerceIn(MIN_EDGE_THRESHOLD_SQ, MAX_EDGE_THRESHOLD_SQ)
+            val strongSq = (maxContrast * STRONG_INK_SHARE)
+                .coerceIn(MIN_STRONG_THRESHOLD_SQ, MAX_STRONG_THRESHOLD_SQ)
+            for (index in crop.indices) {
+                if (!localAllowed[index]) continue
+                val backgroundDistance = distances[index]
                 if (backgroundDistance < thresholdSq) continue
                 var inkDistance = Float.MAX_VALUE
                 references.forEach { reference ->
-                    val distance = colorDistanceSq(pixel, reference)
+                    val distance = colorDistanceSq(crop[index], reference)
                     if (distance < inkDistance) inkDistance = distance
                 }
                 if (inkDistance <= backgroundDistance * INK_VS_BACKGROUND_RATIO ||
                     backgroundDistance >= strongSq
                 ) {
-                    output[index] = true
+                    mask[index] = true
                     inkCount++
                 }
             }
+            if (allowedCount > MIN_FALLBACK_AREA && inkCount < allowedCount * MIN_REGION_INK_SHARE) {
+                // Colour separation failed (very low contrast, rainbow text, an
+                // unusual background): erase the whole allowed area rather than
+                // leave original glyphs visible. Texture synthesis fills it later.
+                copyAllowed(localAllowed, mask)
+                inkCount = allowedCount
+            }
         }
-        if (allowedCount > MIN_FALLBACK_AREA && inkCount < allowedCount * MIN_REGION_INK_SHARE) {
-            // Colour separation failed (very low contrast, rainbow text, an
-            // unusual background): erase the whole allowed area rather than
-            // leave original glyphs visible. Texture synthesis fills it later.
-            copyAllowed(rect, width, allowed, output)
+        if (inkCount == 0) return false
+
+        val dilated = dilate(mask, cropWidth, cropHeight, dilationRadius)
+        for (y in 0 until cropHeight) {
+            val cropRow = y * cropWidth
+            val globalRow = (cropTop + y) * width
+            for (x in 0 until cropWidth) {
+                if (dilated[cropRow + x]) result[globalRow + cropLeft + x] = true
+            }
         }
+        return true
     }
 
-    private fun copyAllowed(rect: Rect, width: Int, allowed: BooleanArray, output: BooleanArray) {
-        for (y in rect.top until rect.bottom) {
-            val row = y * width
-            for (x in rect.left until rect.right) {
-                val index = row + x
-                if (allowed[index]) output[index] = true
-            }
+    private fun copyAllowed(allowed: BooleanArray, output: BooleanArray) {
+        for (index in allowed.indices) {
+            if (allowed[index]) output[index] = true
         }
     }
 
@@ -818,6 +876,7 @@ class BackgroundRestorer @Inject constructor() {
         const val MIN_INK_REFERENCE_DISTANCE_SQ = 0.0018f
         const val MAX_INK_REFERENCES = 16
         const val MIN_CLASSIFIABLE_CONTRAST_SQ = 0.0025f
+        const val FULL_BLOCK_ERASE_CONTRAST_SQ = 0.03f
         const val EDGE_INK_SHARE = 0.14f
         const val STRONG_INK_SHARE = 0.55f
         const val MIN_EDGE_THRESHOLD_SQ = 0.0015f

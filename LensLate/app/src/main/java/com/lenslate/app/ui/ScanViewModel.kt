@@ -499,9 +499,14 @@ class ScanViewModel @Inject constructor(
                 refreshModelPacks()
                 val pair = TranslationPair(from = effectiveSource, to = target)
                 val protectedCount = document.regions.count { it.isProtected }
+                val uncertainCount = document.regions.count { region ->
+                    region.text.isNotBlank() && !region.isFormula && !region.isProtected &&
+                        region.confidence != null && region.confidence < MIN_REPLACE_CONFIDENCE
+                }
                 val translatableIndices = document.regions.indices.filter { index ->
                     val region = document.regions[index]
-                    region.text.isNotBlank() && !region.isFormula && !region.isProtected
+                    region.text.isNotBlank() && !region.isFormula && !region.isProtected &&
+                        region.confidence?.let { it >= MIN_REPLACE_CONFIDENCE } != false
                 }
                 if (translatableIndices.isEmpty()) {
                     mutate {
@@ -510,17 +515,25 @@ class ScanViewModel @Inject constructor(
                             document = document,
                             rendered = bitmap,
                             progress = it.progress.copy(
-                                translate = StepState.Done(0, "Формулы, числа и изображения"),
+                                translate = StepState.Done(
+                                    0,
+                                    when {
+                                        uncertainCount > 0 -> "Все блоки с низкой уверенностью"
+                                        else -> "Формулы, числа и изображения"
+                                    },
+                                ),
                                 inpaint = StepState.Done(0, "Пропущено"),
                                 render = StepState.Done(0, "Оставлено без изменений"),
                             ),
                         )
                     }
                     notify(
-                        if (protectedCount > 0) {
-                            "Формулы и $protectedCount блоков внутри изображений сохранены как в оригинале"
-                        } else {
-                            "Формулы и числа сохранены как в оригинале"
+                        when {
+                            uncertainCount > 0 ->
+                                "$uncertainCount блоков оставлено как в оригинале — низкая уверенность распознавания"
+                            protectedCount > 0 ->
+                                "Формулы и $protectedCount блоков внутри изображений сохранены как в оригинале"
+                            else -> "Формулы и числа сохранены как в оригинале"
                         },
                     )
                     return@launch
@@ -648,6 +661,9 @@ class ScanViewModel @Inject constructor(
                 val preservedSuffix = buildString {
                     if (preservedFormulas > 0) append(" · $preservedFormulas формул без изменений")
                     if (protectedCount > 0) append(" · $protectedCount блоков в изображениях сохранено")
+                    if (uncertainCount > 0) {
+                        append(" · $uncertainCount блоков оставлено (низкая уверенность)")
+                    }
                 }
                 notify(
                     if (failed > 0) {
@@ -870,5 +886,11 @@ class ScanViewModel @Inject constructor(
 
     private companion object {
         const val APPROXIMATE_MODEL_MB = 30
+
+        /**
+         * Blocks below this OCR confidence are left as the original: a wrong
+         * reading painted over the photo looks worse than untranslated text.
+         */
+        const val MIN_REPLACE_CONFIDENCE = 0.70f
     }
 }
