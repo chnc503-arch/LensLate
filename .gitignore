@@ -1,0 +1,39 @@
+# Android build artifacts
+build/
+**/build/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.hprof
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Gradle caches
+.gradle/
+**/.gradle/
+gradle-app.setting
+.gradletasknamecache
+
+# Android Studio / IntelliJ
+.idea/
+**/.idea/
+*.iml
+
+# Local machine configuration
+local.properties
+
+# Signing secrets
+*.jks
+*.keystore
+keystore.properties
+
+# Logs and local backups
+*.log
+backup_*/
+
+# OS files
+.DS_Store
+Thumbs.db

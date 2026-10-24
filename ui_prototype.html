@@ -1,0 +1,1695 @@
+<title>LensLate</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+
+<style>
+/*
+  Layout: single-column app shell, header + content area + floating action
+  Subject: precision document translation — technical, exact, minimal
+*/
+
+/* ── Tokens ───────────────────────────────────────────────────── */
+:root {
+  --bg:          #F7F8FA;
+  --bg-card:     #FFFFFF;
+  --bg-inset:    #EDEEF2;
+  --fg:          #0D0F14;
+  --fg-2:        #5A5E6B;
+  --fg-3:        #9499A8;
+  --accent:      #2563EB;
+  --accent-2:    #EFF4FF;
+  --accent-dim:  #93B4FA;
+  --ok:          #16A34A;
+  --ok-bg:       #DCFCE7;
+  --warn:        #D97706;
+  --warn-bg:     #FEF3C7;
+  --border:      #E2E4EB;
+  --shadow-sm:   0 1px 3px rgba(13,15,20,.06), 0 1px 2px rgba(13,15,20,.04);
+  --shadow-md:   0 4px 16px rgba(13,15,20,.08), 0 1px 4px rgba(13,15,20,.04);
+  --r:           10px;
+  --r-lg:        16px;
+  --font-ui:     'Inter', system-ui, sans-serif;
+  --font-mono:   'JetBrains Mono', monospace;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg:          #0B0D12;
+    --bg-card:     #13161E;
+    --bg-inset:    #1C2030;
+    --fg:          #EEF0F6;
+    --fg-2:        #8B91A4;
+    --fg-3:        #555B6E;
+    --accent:      #4B8BF5;
+    --accent-2:    #131C35;
+    --accent-dim:  #2A4C8C;
+    --ok:          #4ADE80;
+    --ok-bg:       #052E16;
+    --warn:        #FBB740;
+    --warn-bg:     #2D1A00;
+    --border:      #222636;
+    --shadow-sm:   0 1px 3px rgba(0,0,0,.3);
+    --shadow-md:   0 4px 16px rgba(0,0,0,.4);
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg:          #0B0D12;
+  --bg-card:     #13161E;
+  --bg-inset:    #1C2030;
+  --fg:          #EEF0F6;
+  --fg-2:        #8B91A4;
+  --fg-3:        #555B6E;
+  --accent:      #4B8BF5;
+  --accent-2:    #131C35;
+  --accent-dim:  #2A4C8C;
+  --ok:          #4ADE80;
+  --ok-bg:       #052E16;
+  --warn:        #FBB740;
+  --warn-bg:     #2D1A00;
+  --border:      #222636;
+  --shadow-sm:   0 1px 3px rgba(0,0,0,.3);
+  --shadow-md:   0 4px 16px rgba(0,0,0,.4);
+  color-scheme: dark;
+}
+
+/* ── Reset / Base ─────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+
+body {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 0;
+}
+
+button { cursor: pointer; border: none; background: none; font-family: inherit; }
+input, select { font-family: inherit; }
+img { max-width: 100%; }
+
+/* ── Header ───────────────────────────────────────────────────── */
+.header {
+  position: sticky;
+  top: env(safe-area-inset-top, 0px);
+  z-index: 100;
+  background: var(--bg-card);
+  border-bottom: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0 0 auto;
+  height: env(safe-area-inset-top, 0px);
+  z-index: 101;
+  background: var(--bg-card);
+}
+
+.header-inner {
+  max-width: 960px;
+  margin: 0 auto;
+  padding-block: 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.logo-mark {
+  width: 32px; height: 32px;
+  background: var(--accent);
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+
+.logo-mark svg { width: 18px; height: 18px; }
+
+.logo-name {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -.3px;
+  color: var(--fg);
+}
+
+.logo-name span { color: var(--accent); }
+
+.header-spacer { flex: 1; }
+
+.theme-btn {
+  width: 36px; height: 36px;
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--fg-2);
+  transition: background .15s, color .15s;
+}
+.theme-btn:hover { background: var(--bg-inset); color: var(--fg); }
+.theme-btn svg { width: 18px; height: 18px; }
+
+/* ── Main layout ──────────────────────────────────────────────── */
+.main {
+  flex: 1;
+  max-width: 960px;
+  width: 100%;
+  margin: 0 auto;
+  padding-block: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* ── Language bar ─────────────────────────────────────────────── */
+.lang-bar {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-sm);
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.lang-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .6px;
+  text-transform: uppercase;
+  color: var(--fg-3);
+  white-space: nowrap;
+}
+
+.lang-select-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 200px;
+}
+
+.lang-select {
+  flex: 1;
+  padding: 7px 10px;
+  border-radius: 7px;
+  border: 1.5px solid var(--border);
+  background: var(--bg-inset);
+  color: var(--fg);
+  font-size: 13px;
+  font-weight: 500;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' fill='none'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%239499A8' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding-right: 28px;
+  cursor: pointer;
+  transition: border-color .15s;
+}
+.lang-select:focus { outline: none; border-color: var(--accent); }
+
+.swap-btn {
+  width: 34px; height: 34px;
+  border-radius: 8px;
+  background: var(--accent-2);
+  color: var(--accent);
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  transition: background .15s, transform .2s;
+}
+.swap-btn:hover { background: var(--accent); color: #fff; transform: rotate(180deg); }
+.swap-btn svg { width: 16px; height: 16px; }
+
+.lang-divider {
+  width: 1px;
+  height: 28px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+
+.quality-badge {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  background: var(--ok-bg);
+  color: var(--ok);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .3px;
+  white-space: nowrap;
+}
+.quality-badge::before {
+  content: '';
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+  flex-shrink: 0;
+}
+
+/* ── Upload zone ──────────────────────────────────────────────── */
+.upload-zone {
+  border: 2px dashed var(--border);
+  border-radius: var(--r-lg);
+  background: var(--bg-card);
+  padding: 48px 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .2s, background .2s;
+  position: relative;
+}
+
+.upload-zone:hover,
+.upload-zone.drag-over {
+  border-color: var(--accent);
+  background: var(--accent-2);
+}
+
+.upload-zone.has-image {
+  padding: 0;
+  border: none;
+  cursor: default;
+  background: transparent;
+}
+
+.upload-icon {
+  width: 56px; height: 56px;
+  border-radius: 14px;
+  background: var(--accent-2);
+  display: flex; align-items: center; justify-content: center;
+}
+.upload-icon svg { width: 28px; height: 28px; color: var(--accent); }
+
+.upload-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.upload-sub {
+  font-size: 13px;
+  color: var(--fg-2);
+  max-width: 320px;
+  line-height: 1.6;
+}
+
+.upload-types {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.type-chip {
+  padding: 3px 9px;
+  border-radius: 5px;
+  background: var(--bg-inset);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-3);
+  font-family: var(--font-mono);
+  letter-spacing: .3px;
+}
+
+.upload-btn {
+  padding: 10px 24px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  transition: opacity .15s, transform .1s;
+}
+.upload-btn:hover { opacity: .88; transform: translateY(-1px); }
+.upload-btn:active { transform: translateY(0); }
+
+#file-input { display: none; }
+
+/* ── Image preview area ───────────────────────────────────────── */
+.preview-wrap {
+  display: none;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.preview-wrap.visible { display: flex; }
+
+.preview-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.preview-toolbar {
+  padding: 10px 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.preview-filename {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg-2);
+  font-family: var(--font-mono);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.tb-btn {
+  padding: 5px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg-2);
+  display: flex; align-items: center; gap: 5px;
+  transition: background .15s, color .15s;
+  white-space: nowrap;
+}
+.tb-btn:hover { background: var(--bg-inset); color: var(--fg); }
+.tb-btn.danger:hover { background: #FEE2E2; color: #DC2626; }
+.tb-btn svg { width: 14px; height: 14px; flex-shrink: 0; }
+
+.view-toggle {
+  display: flex;
+  background: var(--bg-inset);
+  border-radius: 7px;
+  padding: 2px;
+}
+
+.view-tab {
+  padding: 4px 10px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-3);
+  transition: background .15s, color .15s;
+  white-space: nowrap;
+}
+.view-tab.active {
+  background: var(--bg-card);
+  color: var(--fg);
+  box-shadow: var(--shadow-sm);
+}
+
+.image-canvas-wrap {
+  position: relative;
+  overflow: hidden;
+  max-height: 60vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-inset);
+}
+
+#preview-img {
+  max-width: 100%;
+  max-height: 60vh;
+  display: block;
+  object-fit: contain;
+}
+
+/* OCR overlays on the image */
+.ocr-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.text-block {
+  position: absolute;
+  border: 1.5px solid var(--accent);
+  border-radius: 3px;
+  background: rgba(37,99,235,.08);
+  cursor: pointer;
+  pointer-events: all;
+  transition: background .15s;
+}
+.text-block:hover { background: rgba(37,99,235,.18); }
+.text-block.selected {
+  border-color: #F59E0B;
+  background: rgba(245,158,11,.15);
+}
+
+/* Translation overlay blocks */
+.trans-block {
+  position: absolute;
+  border-radius: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 4px;
+  pointer-events: all;
+  cursor: pointer;
+  font-weight: 500;
+  line-height: 1.2;
+  text-align: center;
+}
+
+/* ── Processing panel ─────────────────────────────────────────── */
+.process-panel {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.process-header {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.process-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  flex: 1;
+}
+
+.process-steps {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.step {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.step-icon {
+  width: 28px; height: 28px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.step-icon.pending {
+  background: var(--bg-inset);
+  color: var(--fg-3);
+}
+
+.step-icon.running {
+  background: var(--accent-2);
+  color: var(--accent);
+}
+
+.step-icon.done {
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+
+.step-icon.error {
+  background: #FEE2E2;
+  color: #DC2626;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.step-icon.running svg { animation: spin .8s linear infinite; }
+.step-icon.done svg, .step-icon.error svg { animation: none; }
+
+.step-info { flex: 1; min-width: 0; }
+
+.step-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.step-detail {
+  font-size: 11px;
+  color: var(--fg-3);
+  margin-top: 1px;
+  font-family: var(--font-mono);
+}
+
+.step-time {
+  font-size: 11px;
+  color: var(--fg-3);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+/* Progress bar */
+.progress-bar-wrap {
+  padding: 0 16px 16px;
+}
+
+.progress-track {
+  height: 4px;
+  background: var(--bg-inset);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width .4s ease;
+}
+
+/* ── Translate button ─────────────────────────────────────────── */
+.translate-btn {
+  width: 100%;
+  padding: 14px 24px;
+  border-radius: var(--r);
+  background: var(--accent);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -.1px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  box-shadow: 0 2px 8px rgba(37,99,235,.3);
+  transition: opacity .15s, transform .1s, box-shadow .15s;
+}
+.translate-btn:hover {
+  opacity: .92;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(37,99,235,.38);
+}
+.translate-btn:active { transform: translateY(0); box-shadow: none; }
+.translate-btn:disabled {
+  opacity: .4;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+.translate-btn svg { width: 18px; height: 18px; }
+
+/* ── Results ──────────────────────────────────────────────────── */
+.results-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+  display: none;
+}
+.results-card.visible { display: block; }
+
+.results-header {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.results-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  flex: 1;
+}
+
+.stat-chips {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.stat-chip {
+  padding: 3px 9px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.stat-chip.ok { background: var(--ok-bg); color: var(--ok); }
+.stat-chip.warn { background: var(--warn-bg); color: var(--warn); }
+.stat-chip.info { background: var(--accent-2); color: var(--accent); }
+
+.results-list {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.result-item {
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  transition: border-color .15s;
+}
+.result-item:hover { border-color: var(--accent-dim); }
+.result-item.selected { border-color: var(--accent); }
+
+.result-item-header {
+  padding: 8px 12px;
+  background: var(--bg-inset);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.result-num {
+  width: 20px; height: 20px;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+}
+
+.result-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.result-orig {
+  font-size: 12px;
+  color: var(--fg-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.result-conf {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--fg-3);
+  margin-top: 1px;
+}
+
+.conf-dot {
+  width: 5px; height: 5px;
+  border-radius: 50%;
+}
+
+.result-trans {
+  padding: 10px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--fg);
+  border-top: 1px solid var(--border);
+  line-height: 1.5;
+}
+
+/* ── Save bar ─────────────────────────────────────────────────── */
+.save-bar {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-sm);
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  display: none;
+}
+.save-bar.visible { display: flex; }
+
+.save-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  flex: 1;
+}
+
+.save-btns {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.save-btn {
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  display: flex; align-items: center; gap: 6px;
+  transition: background .15s, color .15s, transform .1s;
+}
+.save-btn:hover { transform: translateY(-1px); }
+.save-btn:active { transform: translateY(0); }
+
+.save-btn.primary { background: var(--accent); color: #fff; }
+.save-btn.primary:hover { opacity: .88; }
+.save-btn.secondary {
+  background: var(--bg-inset);
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+.save-btn.secondary:hover { background: var(--border); }
+.save-btn svg { width: 14px; height: 14px; }
+
+/* ── Model manager ────────────────────────────────────────────── */
+.model-manager {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.model-header {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.model-title { font-size: 13px; font-weight: 600; color: var(--fg); flex: 1; }
+
+.model-list {
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.model-row {
+  padding: 10px 10px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transition: background .15s;
+}
+.model-row:hover { background: var(--bg-inset); }
+
+.model-langs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 90px;
+}
+
+.lang-tag {
+  padding: 3px 7px;
+  border-radius: 4px;
+  background: var(--bg-inset);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--fg-2);
+  font-family: var(--font-mono);
+  letter-spacing: .3px;
+}
+
+.arrow-icon { color: var(--fg-3); flex-shrink: 0; }
+.arrow-icon svg { width: 12px; height: 12px; display: block; }
+
+.model-info { flex: 1; min-width: 0; }
+
+.model-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg);
+}
+
+.model-size {
+  font-size: 11px;
+  color: var(--fg-3);
+  font-family: var(--font-mono);
+  margin-top: 1px;
+}
+
+.model-status { flex-shrink: 0; }
+
+.dl-btn {
+  padding: 5px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--accent-2);
+  color: var(--accent);
+  transition: background .15s;
+}
+.dl-btn:hover { background: var(--accent); color: #fff; }
+
+.installed-badge {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ok);
+}
+.installed-badge svg { width: 14px; height: 14px; }
+
+.dl-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mini-progress {
+  width: 60px;
+  height: 4px;
+  background: var(--bg-inset);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.mini-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width .3s;
+}
+
+.dl-pct {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--fg-3);
+  white-space: nowrap;
+}
+
+/* ── Toast ────────────────────────────────────────────────────── */
+.toast-container {
+  position: fixed;
+  bottom: max(24px, env(safe-area-inset-bottom, 0px));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  background: var(--fg);
+  color: var(--bg);
+  padding: 10px 18px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 500;
+  box-shadow: var(--shadow-md);
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity .2s, transform .2s;
+  white-space: nowrap;
+}
+.toast.show { opacity: 1; transform: translateY(0); }
+
+/* ── Scroll styling ───────────────────────────────────────────── */
+.results-list::-webkit-scrollbar { width: 4px; }
+.results-list::-webkit-scrollbar-track { background: transparent; }
+.results-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* ── Responsive ───────────────────────────────────────────────── */
+@media (max-width: 600px) {
+  .lang-bar { flex-direction: column; align-items: stretch; }
+  .lang-select-wrap { min-width: 0; }
+  .lang-divider { display: none; }
+  .process-steps { gap: 8px; }
+  .save-bar { flex-direction: column; align-items: stretch; }
+  .save-btns { flex-direction: column; }
+  .save-btn { justify-content: center; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
+</style>
+
+<!-- ═══════════════════════════════════════════════════════════════ -->
+
+<header class="header">
+  <div class="header-inner">
+    <div class="logo">
+      <div class="logo-mark">
+        <svg viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="2" y="2" width="14" height="14" rx="3" stroke="#fff" stroke-width="1.5"/>
+          <path d="M5 6h8M5 9h5M5 12h6" stroke="#fff" stroke-width="1.5" stroke-linecap="round"/>
+          <circle cx="13.5" cy="11.5" r="2.5" fill="#fff" opacity=".3"/>
+          <path d="M12.5 11.5h2M13.5 10.5v2" stroke="#fff" stroke-width="1" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <span class="logo-name">Lens<span>Late</span></span>
+    </div>
+
+    <div class="header-spacer"></div>
+
+    <button class="theme-btn" id="theme-toggle" title="Переключить тему" aria-label="Переключить тему">
+      <svg id="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+      <svg id="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" hidden><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    </button>
+  </div>
+</header>
+
+<main class="main">
+
+  <!-- Language selection bar -->
+  <div class="lang-bar">
+    <span class="lang-label">Перевод</span>
+
+    <div class="lang-select-wrap">
+      <select class="lang-select" id="lang-from" aria-label="Язык источника">
+        <option value="auto">🔍 Авто-определение</option>
+        <option value="en">🇬🇧 Английский</option>
+        <option value="ru" selected>🇷🇺 Русский</option>
+        <option value="ja">🇯🇵 Японский</option>
+      </select>
+
+      <button class="swap-btn" id="swap-langs" title="Поменять языки местами" aria-label="Поменять языки">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2 5h10M9 2l3 3-3 3M14 11H4M7 8l-3 3 3 3"/>
+        </svg>
+      </button>
+
+      <select class="lang-select" id="lang-to" aria-label="Язык перевода">
+        <option value="en" selected>🇬🇧 Английский</option>
+        <option value="ru">🇷🇺 Русский</option>
+        <option value="ja">🇯🇵 Японский</option>
+      </select>
+    </div>
+
+    <div class="lang-divider"></div>
+    <div class="quality-badge">OPUS-MT · Офлайн</div>
+  </div>
+
+  <!-- Upload zone -->
+  <div class="upload-zone" id="upload-zone" role="button" tabindex="0" aria-label="Загрузить изображение">
+    <div class="upload-icon">
+      <svg viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="22" height="22" rx="4"/>
+        <circle cx="9.5" cy="9.5" r="2.5"/>
+        <path d="M3 18l7-7 5 5 3-3 7 7"/>
+      </svg>
+    </div>
+    <div>
+      <div class="upload-title">Загрузите изображение</div>
+      <div class="upload-sub">Технический чертёж, документ, схема — любой формат с текстом</div>
+    </div>
+    <div class="upload-types">
+      <span class="type-chip">PNG</span>
+      <span class="type-chip">JPG</span>
+      <span class="type-chip">WEBP</span>
+      <span class="type-chip">BMP</span>
+      <span class="type-chip">TIFF</span>
+    </div>
+    <button class="upload-btn" tabindex="-1">Выбрать файл</button>
+    <input type="file" id="file-input" accept="image/*" aria-hidden="true">
+  </div>
+
+  <!-- Preview area (hidden until image loaded) -->
+  <div class="preview-wrap" id="preview-wrap">
+
+    <!-- Image viewer -->
+    <div class="preview-card">
+      <div class="preview-toolbar">
+        <span class="preview-filename" id="preview-filename">document.png</span>
+        <div class="view-toggle" role="tablist" aria-label="Режим просмотра">
+          <button class="view-tab active" id="tab-original" role="tab" aria-selected="true">Оригинал</button>
+          <button class="view-tab" id="tab-translated" role="tab" aria-selected="false">Перевод</button>
+          <button class="view-tab" id="tab-compare" role="tab" aria-selected="false">Оба</button>
+        </div>
+        <button class="tb-btn" id="zoom-fit" title="По размеру">
+          <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+            <path d="M1 5V1h4M9 1h4v4M13 9v4H9M5 13H1V9"/>
+          </svg>
+          Вписать
+        </button>
+        <button class="tb-btn danger" id="clear-image" title="Очистить">
+          <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+            <path d="M2 2l10 10M12 2L2 12"/>
+          </svg>
+          Очистить
+        </button>
+      </div>
+
+      <div class="image-canvas-wrap" id="canvas-wrap">
+        <img id="preview-img" alt="Загруженное изображение" src="">
+        <div class="ocr-overlay" id="ocr-overlay"></div>
+      </div>
+    </div>
+
+    <!-- Processing panel -->
+    <div class="process-panel" id="process-panel">
+      <div class="process-header">
+        <span class="process-title">Обработка</span>
+        <span id="process-status" class="stat-chip info" style="display:none"></span>
+      </div>
+
+      <div class="process-steps" id="process-steps">
+        <div class="step" data-step="ocr">
+          <div class="step-icon pending" id="step-ocr-icon">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <rect x="2" y="2" width="12" height="12" rx="2"/>
+              <path d="M4.5 5h7M4.5 8h5M4.5 11h6"/>
+            </svg>
+          </div>
+          <div class="step-info">
+            <div class="step-name">OCR — распознавание текста</div>
+            <div class="step-detail" id="step-ocr-detail">ML Kit Text Recognition v2</div>
+          </div>
+          <span class="step-time" id="step-ocr-time"></span>
+        </div>
+
+        <div class="step" data-step="lang">
+          <div class="step-icon pending" id="step-lang-icon">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <circle cx="8" cy="8" r="6"/>
+              <path d="M8 2c-2 2-2 8 0 12M2 8h12"/>
+            </svg>
+          </div>
+          <div class="step-info">
+            <div class="step-name">Определение языка</div>
+            <div class="step-detail" id="step-lang-detail">Анализ символов</div>
+          </div>
+          <span class="step-time" id="step-lang-time"></span>
+        </div>
+
+        <div class="step" data-step="translate">
+          <div class="step-icon pending" id="step-translate-icon">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <path d="M2 4h6M2 8h4M8 4l2 8M10 12h4"/>
+              <path d="M10 8l1.5 2 1.5-2"/>
+            </svg>
+          </div>
+          <div class="step-info">
+            <div class="step-name">Перевод</div>
+            <div class="step-detail" id="step-translate-detail">OPUS-MT · Helsinki-NLP</div>
+          </div>
+          <span class="step-time" id="step-translate-time"></span>
+        </div>
+
+        <div class="step" data-step="inpaint">
+          <div class="step-icon pending" id="step-inpaint-icon">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <rect x="2" y="2" width="12" height="12" rx="2"/>
+              <path d="M5 11c1-3 5-3 6 0"/>
+              <circle cx="6" cy="7" r="1.2" fill="currentColor"/>
+              <circle cx="10" cy="7" r="1.2" fill="currentColor"/>
+            </svg>
+          </div>
+          <div class="step-info">
+            <div class="step-name">Восстановление фона</div>
+            <div class="step-detail" id="step-inpaint-detail">OpenCV Inpainting (TELEA)</div>
+          </div>
+          <span class="step-time" id="step-inpaint-time"></span>
+        </div>
+
+        <div class="step" data-step="render">
+          <div class="step-icon pending" id="step-render-icon">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <path d="M3 4l2 8M3 4h4M5 8h3M9 4h1.5a2 2 0 1 1 0 4H9v4"/>
+            </svg>
+          </div>
+          <div class="step-info">
+            <div class="step-name">Рендеринг текста</div>
+            <div class="step-detail" id="step-render-detail">Подбор шрифта, цвета, масштаба</div>
+          </div>
+          <span class="step-time" id="step-render-time"></span>
+        </div>
+      </div>
+
+      <div class="progress-bar-wrap">
+        <div class="progress-track">
+          <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Translate button -->
+    <button class="translate-btn" id="translate-btn" disabled>
+      <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M2 5h8M2 9h5M9 5l2 8M11 13h5"/>
+        <path d="M11 9l1.5 2 1.5-2"/>
+      </svg>
+      Перевести
+    </button>
+
+    <!-- Results -->
+    <div class="results-card" id="results-card">
+      <div class="results-header">
+        <span class="results-title">Найденные блоки текста</span>
+        <div class="stat-chips">
+          <span class="stat-chip ok" id="chip-found">0 блоков</span>
+          <span class="stat-chip info" id="chip-conf">— уверенность</span>
+        </div>
+      </div>
+      <div class="results-list" id="results-list"></div>
+    </div>
+
+    <!-- Save bar -->
+    <div class="save-bar" id="save-bar">
+      <span class="save-title">Результат готов — сохраните переведённое изображение</span>
+      <div class="save-btns">
+        <button class="save-btn primary" id="save-png">
+          <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M7 1v8M4 6l3 3 3-3M2 11h10"/></svg>
+          Сохранить PNG
+        </button>
+        <button class="save-btn secondary" id="save-share">
+          <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="11" cy="2.5" r="1.5"/><circle cx="11" cy="11.5" r="1.5"/><circle cx="3" cy="7" r="1.5"/><path d="M4.4 6.2l5.2-3M4.4 7.8l5.2 3"/></svg>
+          Поделиться
+        </button>
+      </div>
+    </div>
+
+  </div><!-- /preview-wrap -->
+
+  <!-- Model manager (always visible) -->
+  <div class="model-manager">
+    <div class="model-header">
+      <span class="model-title">Языковые модели</span>
+      <span class="stat-chip info">OPUS-MT</span>
+    </div>
+    <div class="model-list" id="model-list"></div>
+  </div>
+
+</main>
+
+<!-- Toast container -->
+<div class="toast-container" id="toast-container" aria-live="polite"></div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────
+const state = {
+  image: null,
+  filename: '',
+  translating: false,
+  translated: false,
+  currentView: 'original',
+  selectedBlock: null,
+  results: [],
+};
+
+const MODELS = [
+  { from:'en', to:'ru', name:'opus-mt-en-ru', size:'76 МБ', installed: true,  dl: 0 },
+  { from:'ru', to:'en', name:'opus-mt-ru-en', size:'74 МБ', installed: false, dl: 0 },
+  { from:'en', to:'ja', name:'opus-mt-en-jap', size:'82 МБ', installed: false, dl: 0 },
+  { from:'ja', to:'en', name:'opus-mt-jap-en', size:'79 МБ', installed: false, dl: 0 },
+  { from:'ru', to:'ja', name:'opus-mt-ru-jap', size:'81 МБ', installed: false, dl: 0 },
+  { from:'ja', to:'ru', name:'opus-mt-jap-ru', size:'80 МБ', installed: false, dl: 0 },
+];
+
+// Simulated OCR results for demo
+const DEMO_RESULTS = [
+  { id:1, orig:'TECHNICAL DRAWING', trans:'ТЕХНИЧЕСКИЙ ЧЕРТЁЖ', conf:0.98, color:'#1a1a1a', size:18 },
+  { id:2, orig:'Scale 1:50', trans:'Масштаб 1:50', conf:0.97, color:'#1a1a1a', size:12 },
+  { id:3, orig:'Material: Steel ST52', trans:'Материал: Сталь СТ52', conf:0.96, color:'#333', size:11 },
+  { id:4, orig:'Wall thickness: 8mm', trans:'Толщина стенки: 8 мм', conf:0.95, color:'#333', size:11 },
+  { id:5, orig:'Tolerance ±0.05', trans:'Допуск ±0,05', conf:0.99, color:'#555', size:10 },
+  { id:6, orig:'Rev. A — 2024-03', trans:'Рев. А — 2024-03', conf:0.97, color:'#777', size:10 },
+];
+
+// ── DOM refs ───────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const uploadZone   = $('upload-zone');
+const fileInput    = $('file-input');
+const previewWrap  = $('preview-wrap');
+const previewImg   = $('preview-img');
+const previewFname = $('preview-filename');
+const clearBtn     = $('clear-image');
+const translateBtn = $('translate-btn');
+const resultsCard  = $('results-card');
+const resultsList  = $('results-list');
+const saveBar      = $('save-bar');
+const progressFill = $('progress-fill');
+const themeToggle  = $('theme-toggle');
+const modelList    = $('model-list');
+const tabOriginal  = $('tab-original');
+const tabTranslated= $('tab-translated');
+const tabCompare   = $('tab-compare');
+const ocrOverlay   = $('ocr-overlay');
+
+// ── Theme toggle ───────────────────────────────────────────────
+let theme = null;
+try { theme = localStorage.getItem('llt_theme'); } catch(e){}
+
+function applyTheme(t) {
+  theme = t;
+  if (t) {
+    document.documentElement.setAttribute('data-theme', t);
+  } else {
+    document.documentElement.removeAttribute('data-theme');
+  }
+  $('icon-sun').hidden = t === 'light';
+  $('icon-moon').hidden = t !== 'light';
+  try { localStorage.setItem('llt_theme', t || ''); } catch(e){}
+}
+
+applyTheme(theme);
+
+themeToggle.addEventListener('click', () => {
+  const isDark = theme === 'dark' ||
+    (!theme && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  applyTheme(isDark ? 'light' : 'dark');
+});
+
+// ── Toast ──────────────────────────────────────────────────────
+function showToast(msg) {
+  const c = $('toast-container');
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.textContent = msg;
+  c.appendChild(t);
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => t.classList.add('show'));
+  });
+  setTimeout(() => {
+    t.classList.remove('show');
+    setTimeout(() => t.remove(), 300);
+  }, 2800);
+}
+
+// ── Model list rendering ───────────────────────────────────────
+function renderModels() {
+  modelList.innerHTML = '';
+  MODELS.forEach((m, i) => {
+    const row = document.createElement('div');
+    row.className = 'model-row';
+    row.innerHTML = `
+      <div class="model-langs">
+        <span class="lang-tag">${m.from.toUpperCase()}</span>
+        <span class="arrow-icon"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2 6h8M7 3l3 3-3 3"/></svg></span>
+        <span class="lang-tag">${m.to.toUpperCase()}</span>
+      </div>
+      <div class="model-info">
+        <div class="model-name">${m.name}</div>
+        <div class="model-size">${m.size}</div>
+      </div>
+      <div class="model-status" id="mstatus-${i}">
+        ${m.installed
+          ? `<span class="installed-badge"><svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 7l4 4 6-6"/></svg>Установлено</span>`
+          : m.dl > 0
+            ? `<div class="dl-progress"><div class="mini-progress"><div class="mini-fill" style="width:${m.dl}%"></div></div><span class="dl-pct">${m.dl}%</span></div>`
+            : `<button class="dl-btn" onclick="downloadModel(${i})">Скачать</button>`
+        }
+      </div>`;
+    modelList.appendChild(row);
+  });
+}
+
+function downloadModel(i) {
+  const m = MODELS[i];
+  if (m.installed || m.dl > 0) return;
+  showToast(`Загрузка ${m.name}…`);
+  m.dl = 1;
+  renderModels();
+
+  const interval = setInterval(() => {
+    m.dl = Math.min(100, m.dl + Math.random() * 8 + 2);
+    const el = $(`mstatus-${i}`);
+    if (el) {
+      const fill = el.querySelector('.mini-fill');
+      const pct  = el.querySelector('.dl-pct');
+      if (fill) fill.style.width = m.dl + '%';
+      if (pct)  pct.textContent  = Math.round(m.dl) + '%';
+    }
+    if (m.dl >= 100) {
+      clearInterval(interval);
+      m.installed = true;
+      m.dl = 0;
+      renderModels();
+      showToast(`✓ ${m.name} установлена`);
+    }
+  }, 200);
+}
+
+renderModels();
+
+// ── Upload ─────────────────────────────────────────────────────
+function loadImage(file) {
+  if (!file || !file.type.startsWith('image/')) {
+    showToast('Пожалуйста, выберите изображение');
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = e => {
+    state.image = e.target.result;
+    state.filename = file.name;
+    state.translated = false;
+    state.results = [];
+    ocrOverlay.innerHTML = '';
+
+    previewImg.src = e.target.result;
+    previewFname.textContent = file.name;
+    uploadZone.style.display = 'none';
+    previewWrap.classList.add('visible');
+    translateBtn.disabled = false;
+    resultsCard.classList.remove('visible');
+    saveBar.classList.remove('visible');
+    progressFill.style.width = '0%';
+    resetSteps();
+    setView('original');
+    showToast('Изображение загружено');
+  };
+  reader.readAsDataURL(file);
+}
+
+uploadZone.addEventListener('click', e => {
+  if (e.target === uploadZone || e.target.closest('.upload-btn') ||
+      e.target === uploadZone.querySelector('.upload-title') ||
+      e.target === uploadZone.querySelector('.upload-sub') ||
+      e.target === uploadZone.querySelector('.upload-icon') ||
+      e.target.closest('.upload-icon') ||
+      e.target.closest('.upload-types') ||
+      e.target.tagName === 'SPAN') {
+    fileInput.click();
+  }
+});
+
+uploadZone.addEventListener('keydown', e => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
+});
+
+fileInput.addEventListener('change', e => { if (e.target.files[0]) loadImage(e.target.files[0]); });
+
+uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault();
+  uploadZone.classList.remove('drag-over');
+  if (e.dataTransfer.files[0]) loadImage(e.dataTransfer.files[0]);
+});
+
+clearBtn.addEventListener('click', () => {
+  state.image = null;
+  state.translated = false;
+  state.results = [];
+  previewImg.src = '';
+  fileInput.value = '';
+  ocrOverlay.innerHTML = '';
+  uploadZone.style.display = '';
+  previewWrap.classList.remove('visible');
+  resultsCard.classList.remove('visible');
+  saveBar.classList.remove('visible');
+  translateBtn.disabled = true;
+  progressFill.style.width = '0%';
+  resetSteps();
+});
+
+// ── View tabs ──────────────────────────────────────────────────
+function setView(v) {
+  state.currentView = v;
+  [tabOriginal, tabTranslated, tabCompare].forEach(t => {
+    t.classList.remove('active');
+    t.setAttribute('aria-selected', 'false');
+  });
+
+  if (v === 'original') {
+    tabOriginal.classList.add('active');
+    tabOriginal.setAttribute('aria-selected', 'true');
+    previewImg.style.display = '';
+    ocrOverlay.style.display = '';
+    // show OCR boxes, hide translation boxes
+    ocrOverlay.querySelectorAll('.text-block').forEach(el => el.style.display = '');
+    ocrOverlay.querySelectorAll('.trans-block').forEach(el => el.style.display = 'none');
+  } else if (v === 'translated') {
+    tabTranslated.classList.add('active');
+    tabTranslated.setAttribute('aria-selected', 'true');
+    previewImg.style.display = '';
+    ocrOverlay.style.display = '';
+    ocrOverlay.querySelectorAll('.text-block').forEach(el => el.style.display = 'none');
+    ocrOverlay.querySelectorAll('.trans-block').forEach(el => el.style.display = '');
+  } else {
+    tabCompare.classList.add('active');
+    tabCompare.setAttribute('aria-selected', 'true');
+    previewImg.style.display = '';
+    ocrOverlay.style.display = '';
+    ocrOverlay.querySelectorAll('.text-block').forEach(el => el.style.display = '');
+    ocrOverlay.querySelectorAll('.trans-block').forEach(el => el.style.display = '');
+  }
+}
+
+tabOriginal.addEventListener('click', () => setView('original'));
+tabTranslated.addEventListener('click', () => { if (state.translated) setView('translated'); else showToast('Сначала выполните перевод'); });
+tabCompare.addEventListener('click', () => { if (state.translated) setView('compare'); else showToast('Сначала выполните перевод'); });
+
+// ── Steps ──────────────────────────────────────────────────────
+const STEP_IDS = ['ocr','lang','translate','inpaint','render'];
+
+function resetSteps() {
+  STEP_IDS.forEach(s => {
+    const icon = $(`step-${s}-icon`);
+    icon.className = 'step-icon pending';
+    icon.innerHTML = iconForStep(s, 'pending');
+    $(`step-${s}-time`).textContent = '';
+  });
+  $('process-status').style.display = 'none';
+}
+
+function iconForStep(s, state) {
+  const icons = {
+    ocr: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="2" y="2" width="12" height="12" rx="2"/><path d="M4.5 5h7M4.5 8h5M4.5 11h6"/></svg>`,
+    lang: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="8" cy="8" r="6"/><path d="M8 2c-2 2-2 8 0 12M2 8h12"/></svg>`,
+    translate: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2 4h6M2 8h4M8 4l2 8M10 12h4"/><path d="M10 8l1.5 2 1.5-2"/></svg>`,
+    inpaint: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="2" y="2" width="12" height="12" rx="2"/><path d="M5 11c1-3 5-3 6 0"/><circle cx="6" cy="7" r="1.2" fill="currentColor"/><circle cx="10" cy="7" r="1.2" fill="currentColor"/></svg>`,
+    render: `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 4l2 8M3 4h4M5 8h3M9 4h1.5a2 2 0 1 1 0 4H9v4"/></svg>`,
+  };
+  if (state === 'running') {
+    return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 2a6 6 0 1 1-4.24 1.76"/></svg>`;
+  }
+  if (state === 'done') {
+    return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8l4 4 6-6"/></svg>`;
+  }
+  return icons[s] || '';
+}
+
+function setStep(s, st, detail, time) {
+  const icon = $(`step-${s}-icon`);
+  icon.className = `step-icon ${st}`;
+  icon.innerHTML = iconForStep(s, st);
+  if (detail) $(`step-${s}-detail`).textContent = detail;
+  if (time)   $(`step-${s}-time`).textContent = time;
+}
+
+// ── Translation simulation ─────────────────────────────────────
+translateBtn.addEventListener('click', async () => {
+  if (state.translating || !state.image) return;
+  state.translating = true;
+  translateBtn.disabled = true;
+  translateBtn.innerHTML = `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 2a6 6 0 1 1-4.24 1.76"/></svg> Обработка…`;
+
+  resetSteps();
+  progressFill.style.width = '0%';
+  resultsCard.classList.remove('visible');
+  saveBar.classList.remove('visible');
+  ocrOverlay.innerHTML = '';
+
+  const delay = ms => new Promise(r => setTimeout(r, ms));
+
+  // Step 1: OCR
+  setStep('ocr', 'running', 'Сканирование текстовых блоков…');
+  await delay(900);
+  progressFill.style.width = '20%';
+  setStep('ocr', 'done', `${DEMO_RESULTS.length} блоков обнаружено`, '0.9с');
+
+  // Render OCR boxes
+  renderOCRBoxes();
+
+  // Step 2: Language detect
+  setStep('lang', 'running', 'Анализ скрипта и символов…');
+  await delay(400);
+  progressFill.style.width = '35%';
+  const fromLang = $('lang-from').value === 'auto' ? 'EN' : $('lang-from').value.toUpperCase();
+  setStep('lang', 'done', `Определён: ${fromLang}`, '0.4с');
+
+  // Step 3: Translate
+  setStep('translate', 'running', 'OPUS-MT · токенизация…');
+  await delay(1400);
+  progressFill.style.width = '60%';
+  setStep('translate', 'done', `${DEMO_RESULTS.length}/${DEMO_RESULTS.length} блоков`, '1.4с');
+
+  // Step 4: Inpaint
+  setStep('inpaint', 'running', 'OpenCV TELEA · восстановление…');
+  await delay(800);
+  progressFill.style.width = '80%';
+  setStep('inpaint', 'done', 'Фон восстановлен', '0.8с');
+
+  // Step 5: Render
+  setStep('render', 'running', 'Подбор шрифта и масштаба…');
+  await delay(600);
+  progressFill.style.width = '100%';
+  setStep('render', 'done', 'Текст отрисован', '0.6с');
+
+  // Show results
+  state.results = DEMO_RESULTS;
+  state.translated = true;
+  state.translating = false;
+
+  renderResults();
+  renderTranslationBlocks();
+
+  resultsCard.classList.add('visible');
+  saveBar.classList.add('visible');
+
+  setView('translated');
+
+  const avgConf = Math.round(DEMO_RESULTS.reduce((a,r) => a + r.conf, 0) / DEMO_RESULTS.length * 100);
+  $('chip-found').textContent = `${DEMO_RESULTS.length} блоков`;
+  $('chip-conf').textContent = `${avgConf}% уверенность`;
+
+  translateBtn.innerHTML = `<svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5h8M2 9h5M9 5l2 8M11 13h5"/><path d="M11 9l1.5 2 1.5-2"/></svg> Перевести снова`;
+  translateBtn.disabled = false;
+
+  showToast('✓ Перевод завершён — 4.1 сек');
+});
+
+// ── OCR boxes ─────────────────────────────────────────────────
+function renderOCRBoxes() {
+  ocrOverlay.innerHTML = '';
+  const w = previewImg.offsetWidth  || 400;
+  const h = previewImg.offsetHeight || 300;
+
+  const positions = [
+    { top:.06, left:.22, width:.55, height:.07 },
+    { top:.16, left:.65, width:.22, height:.05 },
+    { top:.26, left:.08, width:.38, height:.05 },
+    { top:.34, left:.08, width:.36, height:.05 },
+    { top:.44, left:.08, width:.28, height:.04 },
+    { top:.54, left:.08, width:.28, height:.04 },
+  ];
+
+  DEMO_RESULTS.forEach((r, i) => {
+    const p = positions[i] || { top:.1*i, left:.1, width:.4, height:.05 };
+    const div = document.createElement('div');
+    div.className = 'text-block';
+    div.style.cssText = `top:${p.top*100}%;left:${p.left*100}%;width:${p.width*100}%;height:${p.height*100}%`;
+    div.title = r.orig;
+    div.dataset.id = r.id;
+    div.addEventListener('click', () => selectBlock(r.id));
+    ocrOverlay.appendChild(div);
+  });
+}
+
+function renderTranslationBlocks() {
+  // Remove existing trans-blocks
+  ocrOverlay.querySelectorAll('.trans-block').forEach(el => el.remove());
+
+  const positions = [
+    { top:.06, left:.22, width:.55, height:.07, bg:'rgba(255,255,255,0.92)', color:'#1a1a1a', size:18 },
+    { top:.16, left:.65, width:.22, height:.05, bg:'rgba(255,255,255,0.92)', color:'#1a1a1a', size:12 },
+    { top:.26, left:.08, width:.38, height:.05, bg:'rgba(255,255,255,0.88)', color:'#333',    size:11 },
+    { top:.34, left:.08, width:.36, height:.05, bg:'rgba(255,255,255,0.88)', color:'#333',    size:11 },
+    { top:.44, left:.08, width:.28, height:.04, bg:'rgba(255,255,255,0.88)', color:'#555',    size:10 },
+    { top:.54, left:.08, width:.28, height:.04, bg:'rgba(255,255,255,0.88)', color:'#777',    size:10 },
+  ];
+
+  DEMO_RESULTS.forEach((r, i) => {
+    const p = positions[i] || { top:.1*i, left:.1, width:.4, height:.05, bg:'#fff', color:'#000', size:11 };
+    const div = document.createElement('div');
+    div.className = 'trans-block';
+    div.style.cssText = `top:${p.top*100}%;left:${p.left*100}%;width:${p.width*100}%;height:${p.height*100}%;background:${p.bg};color:${p.color};font-size:${p.size * 0.7}px;display:none`;
+    div.textContent = r.trans;
+    div.title = `Оригинал: ${r.orig}`;
+    div.dataset.id = r.id;
+    div.addEventListener('click', () => selectBlock(r.id));
+    ocrOverlay.appendChild(div);
+  });
+}
+
+function selectBlock(id) {
+  state.selectedBlock = id;
+  ocrOverlay.querySelectorAll('.text-block').forEach(el => {
+    el.classList.toggle('selected', parseInt(el.dataset.id) === id);
+  });
+  document.querySelectorAll('.result-item').forEach(el => {
+    el.classList.toggle('selected', parseInt(el.dataset.id) === id);
+    if (parseInt(el.dataset.id) === id) el.scrollIntoView({ behavior:'smooth', block:'nearest' });
+  });
+}
+
+// ── Results list ───────────────────────────────────────────────
+function confColor(c) {
+  if (c >= 0.95) return 'var(--ok)';
+  if (c >= 0.85) return 'var(--warn)';
+  return '#DC2626';
+}
+
+function renderResults() {
+  resultsList.innerHTML = '';
+  state.results.forEach(r => {
+    const item = document.createElement('div');
+    item.className = 'result-item';
+    item.dataset.id = r.id;
+    item.innerHTML = `
+      <div class="result-item-header" tabindex="0" role="button" aria-expanded="true">
+        <span class="result-num">${r.id}</span>
+        <div class="result-meta">
+          <div class="result-orig">${r.orig}</div>
+          <div class="result-conf">
+            <span class="conf-dot" style="background:${confColor(r.conf)}"></span>
+            ${Math.round(r.conf*100)}% уверенность
+          </div>
+        </div>
+      </div>
+      <div class="result-trans">${r.trans}</div>`;
+    item.querySelector('.result-item-header').addEventListener('click', () => selectBlock(r.id));
+    item.querySelector('.result-item-header').addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectBlock(r.id); }
+    });
+    resultsList.appendChild(item);
+  });
+}
+
+// ── Save ───────────────────────────────────────────────────────
+$('save-png').addEventListener('click', () => {
+  showToast('Сохранение доступно в нативном приложении Android');
+});
+
+$('save-share').addEventListener('click', () => {
+  showToast('Поделиться — доступно в нативном приложении');
+});
+
+// ── Swap langs ─────────────────────────────────────────────────
+$('swap-langs').addEventListener('click', () => {
+  const from = $('lang-from');
+  const to   = $('lang-to');
+  const fv   = from.value;
+  const tv   = to.value;
+  if (fv === 'auto') { showToast('Выберите конкретный язык для замены'); return; }
+  // swap
+  for (let opt of from.options) if (opt.value === tv) { from.value = tv; break; }
+  for (let opt of to.options)   if (opt.value === fv) { to.value   = fv; break; }
+  showToast(`Языки переключены: ${tv.toUpperCase()} → ${fv.toUpperCase()}`);
+});
+</script>
