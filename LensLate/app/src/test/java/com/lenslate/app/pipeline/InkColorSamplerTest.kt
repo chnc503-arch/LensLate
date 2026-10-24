@@ -112,6 +112,95 @@ class InkColorSamplerTest {
         assertEquals(black, sampled)
     }
 
+    @Test
+    fun peakModeStaysCloserToInkWhenNoPixelIsFullyCovered() {
+        // A blurry glyph has a coverage gradient instead of a solid core. The
+        // median of the strong pixels lands on the middle coverage, the peak
+        // mode averages the most covered quarter and keeps more saturation.
+        val width = 9
+        val glyphRows = 8
+        val height = glyphRows + 8
+        val crop = solid(width, height, light)
+        for (row in 4 until 4 + glyphRows) {
+            for (x in 1 until width - 1) {
+                val coverage = when (x) {
+                    4 -> 0.90f
+                    3, 5 -> 0.72f
+                    2, 6 -> 0.55f
+                    else -> 0.30f
+                }
+                crop[row * width + x] = StyleGradient.lerpColor(light, red, coverage)
+            }
+        }
+        val backdrop = InkColorSampler.estimateBackdrop(
+            crop.copyOfRange(0, 4 * width),
+            crop.copyOfRange((4 + glyphRows) * width, crop.size),
+            light,
+            red,
+        )
+        val median = InkColorSampler.sampleGlyphColor(
+            pixels = crop,
+            width = width,
+            glyphTop = 4,
+            glyphBottom = 4 + glyphRows,
+            backdrop = backdrop,
+            fallbackInk = green,
+        )
+        val peak = InkColorSampler.sampleGlyphColor(
+            pixels = crop,
+            width = width,
+            glyphTop = 4,
+            glyphBottom = 4 + glyphRows,
+            backdrop = backdrop,
+            fallbackInk = green,
+            mode = InkColorSampler.Mode.PEAK,
+        )
+        assertTrue(
+            "peak=${peak.toHex()} must be closer to ink than median=${median.toHex()}",
+            InkColorSampler.distanceSq(peak, red) < InkColorSampler.distanceSq(median, red),
+        )
+        assertColorNear(red, peak, tolerance = 26)
+    }
+
+    @Test
+    fun peakModeSamplesTextBelowTheNormalContrastFloor() {
+        val width = 10
+        val glyphRows = 6
+        val height = glyphRows + 8
+        val faintInk = 0xFFDCDCDC.toInt()
+        val crop = solid(width, height, light)
+        for (row in 4 until 4 + glyphRows) {
+            for (x in 2 until 8) {
+                crop[row * width + x] = faintInk
+            }
+        }
+        val backdrop = InkColorSampler.estimateBackdrop(
+            crop.copyOfRange(0, 4 * width),
+            crop.copyOfRange((4 + glyphRows) * width, crop.size),
+            light,
+            green,
+        )
+        val median = InkColorSampler.sampleGlyphColor(
+            pixels = crop,
+            width = width,
+            glyphTop = 4,
+            glyphBottom = 4 + glyphRows,
+            backdrop = backdrop,
+            fallbackInk = green,
+        )
+        val peak = InkColorSampler.sampleGlyphColor(
+            pixels = crop,
+            width = width,
+            glyphTop = 4,
+            glyphBottom = 4 + glyphRows,
+            backdrop = backdrop,
+            fallbackInk = green,
+            mode = InkColorSampler.Mode.PEAK,
+        )
+        assertEquals("normal mode keeps the paragraph colour for faint text", green, median)
+        assertColorNear(faintInk, peak, tolerance = 3)
+    }
+
     private fun solid(width: Int, height: Int, color: Int): IntArray =
         IntArray(width * height) { color }
 

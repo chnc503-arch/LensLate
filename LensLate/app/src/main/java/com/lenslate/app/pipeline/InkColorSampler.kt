@@ -2,6 +2,7 @@ package com.lenslate.app.pipeline
 
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
@@ -30,6 +31,18 @@ internal object InkColorSampler {
             return argb(a, r, g, b)
         }
     }
+
+    /**
+     * How the ink colour of a glyph is chosen from its pixels.
+     *
+     * [LOCAL] is the production path: median of strong pixels against the local
+     * backdrop. [PEAK] averages the most-covered quartile instead of the median,
+     * which keeps more saturation when blur has no fully covered core, and
+     * accepts very low contrast so a washed-out glyph is not replaced by the
+     * paragraph colour. It is experimental and only runs in the lab until it is
+     * approved for scanning.
+     */
+    enum class Mode { LOCAL, PEAK }
 
     fun estimateBackdrop(
         topStrip: IntArray,
@@ -72,6 +85,7 @@ internal object InkColorSampler {
         glyphBottom: Int,
         backdrop: Backdrop,
         fallbackInk: Int,
+        mode: Mode = Mode.LOCAL,
     ): Int {
         val rows = glyphBottom - glyphTop
         if (width <= 0 || rows <= 0) return fallbackInk
@@ -92,16 +106,50 @@ internal object InkColorSampler {
                 if (distance > maximumDistance) maximumDistance = distance
             }
         }
-        if (maximumDistance < MIN_CHARACTER_DISTANCE) return fallbackInk
+        val floor = if (mode == Mode.PEAK) MIN_PEAK_CHARACTER_DISTANCE_SQ else MIN_CHARACTER_DISTANCE_SQ
+        if (maximumDistance < floor) return fallbackInk
 
-        val threshold = max(MIN_CHARACTER_DISTANCE, maximumDistance * CHARACTER_STRONG_RATIO)
+        val threshold = max(floor, maximumDistance * CHARACTER_STRONG_RATIO)
         val candidates = ArrayList<Int>()
+        val candidateDistances = ArrayList<Float>()
         for (index in distances.indices) {
             if (distances[index] >= threshold) {
                 candidates += pixels[glyphTop * width + index]
+                candidateDistances += distances[index]
             }
         }
-        return if (candidates.isEmpty()) fallbackInk else medianColor(candidates)
+        if (candidates.isEmpty()) return fallbackInk
+        return when (mode) {
+            Mode.LOCAL -> medianColor(candidates)
+            Mode.PEAK -> peakColor(candidates, candidateDistances)
+        }
+    }
+
+    /**
+     * Mean of the most-covered quartile. Blur leaves no pixel at full coverage,
+     * so the median sits halfway between ink and backdrop; the strongest pixels
+     * stay closest to the designed colour.
+     */
+    private fun peakColor(colors: List<Int>, distances: List<Float>): Int {
+        val order = colors.indices.sortedByDescending { distances[it] }
+        val take = (order.size * PEAK_SHARE).roundToInt().coerceIn(1, order.size)
+        var alphaSum = 0
+        var redSum = 0
+        var greenSum = 0
+        var blueSum = 0
+        for (index in 0 until take) {
+            val color = colors[order[index]]
+            alphaSum += alpha(color)
+            redSum += red(color)
+            greenSum += green(color)
+            blueSum += blue(color)
+        }
+        return argb(
+            alphaSum / take,
+            redSum / take,
+            greenSum / take,
+            blueSum / take,
+        )
     }
 
     private fun usableStripColor(strip: IntArray, globalBackground: Int, inkColor: Int): Int? {
@@ -152,8 +200,10 @@ internal object InkColorSampler {
 
     private const val MIN_CHARACTER_ALPHA = 40
     private const val MIN_STRIP_ALPHA = 40
-    private const val MIN_CHARACTER_DISTANCE = 0.045f
+    private const val MIN_CHARACTER_DISTANCE_SQ = 0.045f
+    private const val MIN_PEAK_CHARACTER_DISTANCE_SQ = 0.0025f
     private const val CHARACTER_STRONG_RATIO = 0.62f
+    private const val PEAK_SHARE = 0.25f
     private const val MIN_STRIP_PIXELS = 8
     private const val MAX_STRIP_TO_INK = 0.12f
     private const val MAX_BACKDROP_RAMP_DISTANCE = 0.85f

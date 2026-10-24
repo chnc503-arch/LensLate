@@ -27,6 +27,7 @@ import com.lenslate.app.pipeline.LanguageDetector
 import com.lenslate.app.pipeline.OcrEngineChoice
 import com.lenslate.app.pipeline.OcrExperimentResult
 import com.lenslate.app.pipeline.OcrProcessor
+import com.lenslate.app.pipeline.StyleStressLab
 import com.lenslate.app.pipeline.TextRenderer
 import com.lenslate.app.pipeline.TranslationEngine
 import com.lenslate.app.util.BitmapUtils
@@ -76,6 +77,9 @@ data class ScanUiState(
     val labPreview: Bitmap? = null,
     val labPreviewName: String? = null,
     val appliedExperiment: AppliedExperiment? = null,
+    /** Synthetic overlay-quality stress report; independent of the current photo. */
+    val styleStress: StyleStressLab.Report? = null,
+    val styleStressRunning: Boolean = false,
     /** Keeps OCR readings that sit inside photos/illustrations untouched. */
     val protectEmbeddedImages: Boolean = true,
     /** Experimental: stricter removal of OCR hallucination on texture. */
@@ -110,6 +114,7 @@ class ScanViewModel @Inject constructor(
     private var loadJob: Job? = null
     private var modelsJob: Job? = null
     private var labJob: Job? = null
+    private var styleStressJob: Job? = null
     private val stateLock = Any()
     private val messageIds = AtomicLong()
 
@@ -709,6 +714,17 @@ class ScanViewModel @Inject constructor(
 
     fun clearLabPreview() {
         mutate { it.copy(labPreview = null, labPreviewName = null) }
+    }
+
+    fun runStyleStressTest() {
+        if (state.styleStressRunning) return
+        styleStressJob?.cancel()
+        styleStressJob = viewModelScope.launch {
+            mutate { it.copy(styleStressRunning = true) }
+            val report = withContext(Dispatchers.Default) { StyleStressLab.run() }
+            mutate { it.copy(styleStressRunning = false, styleStress = report) }
+            notify("Стресс-тест: ${report.passedCount} из ${report.cases.size} кейсов стабильны")
+        }
     }
 
     fun applyLabExperiment(engine: OcrEngineChoice, variantName: String) {

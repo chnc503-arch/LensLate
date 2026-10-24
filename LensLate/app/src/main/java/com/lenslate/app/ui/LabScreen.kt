@@ -30,6 +30,7 @@ import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Image
+import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.RotateRight
@@ -57,6 +58,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontFamily
@@ -70,6 +72,7 @@ import com.lenslate.app.model.DocumentKind
 import com.lenslate.app.model.TextRegionRecord
 import com.lenslate.app.pipeline.OcrEngineChoice
 import com.lenslate.app.pipeline.OcrExperimentResult
+import com.lenslate.app.pipeline.StyleStressLab
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -90,6 +93,7 @@ internal fun LabScreen(
     onProtectEmbeddedImages: (Boolean) -> Unit,
     onAggressiveSanitizer: (Boolean) -> Unit,
     onPreviewProtection: () -> Unit,
+    onRunStyleStress: () -> Unit,
 ) {
     var engineName by rememberSaveable { mutableStateOf(OcrEngineChoice.AUTO.name) }
     val engine = OcrEngineChoice.entries.firstOrNull { it.name == engineName }
@@ -123,6 +127,21 @@ internal fun LabScreen(
                     onClear = onClearApplied,
                 )
             }
+        }
+
+        item {
+            LabSectionHeader(
+                title = "Качество наложения",
+                subtitle = "Синтетические сложные снимки: градиент, замыленность, пересвет, низкий контраст",
+            )
+        }
+
+        item {
+            OverlayStressCard(
+                report = state.styleStress,
+                running = state.styleStressRunning,
+                onRun = onRunStyleStress,
+            )
         }
 
         if (!state.hasImage) {
@@ -778,6 +797,260 @@ private fun SwitchRow(
                 checkedTrackColor = colors.primary,
             ),
         )
+    }
+}
+
+@Composable
+private fun OverlayStressCard(
+    report: StyleStressLab.Report?,
+    running: Boolean,
+    onRun: () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = colors.surface,
+        border = BorderStroke(1.dp, colors.outlineVariant.copy(alpha = 0.7f)),
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Outlined.Palette,
+                    contentDescription = null,
+                    modifier = Modifier.size(17.dp),
+                    tint = colors.primary,
+                )
+                Spacer(Modifier.width(7.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Стресс-тест цвета",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = colors.onSurface,
+                    )
+                    Text(
+                        text = "4 сложных кейса считаются прямо на телефоне",
+                        fontSize = 10.sp,
+                        color = colors.onSurfaceVariant,
+                    )
+                }
+                report?.let { StressVerdictBadge(it.verdict) }
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "Один и тот же пиксельный кейс прогоняется тремя способами: " +
+                    "общий фон страницы (как было), локальный фон под каждым глифом " +
+                    "(сейчас в скане) и пиковый сэмплер — экспериментальный режим для " +
+                    "замыленного, пересвеченного и почти сливающегося текста.",
+                fontSize = 11.sp,
+                lineHeight = 16.sp,
+                color = colors.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = onRun,
+                enabled = !running,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(vertical = 9.dp),
+            ) {
+                if (running) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(14.dp),
+                        strokeWidth = 2.dp,
+                        color = colors.onPrimary,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("Считаем кейсы…", fontSize = 12.sp)
+                } else {
+                    Icon(
+                        imageVector = Icons.Outlined.PlayArrow,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = if (report == null) "Прогнать стресс-тест" else "Прогнать заново",
+                        fontSize = 12.sp,
+                    )
+                }
+            }
+            report?.let { result ->
+                Spacer(Modifier.height(12.dp))
+                result.cases.forEach { case ->
+                    StressCaseRow(case)
+                    Spacer(Modifier.height(8.dp))
+                }
+                HorizontalDivider(color = colors.outlineVariant.copy(alpha = 0.6f))
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = if (result.verdict == StyleStressLab.Verdict.FAIL) {
+                            Icons.Outlined.Close
+                        } else {
+                            Icons.Outlined.Check
+                        },
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                        tint = verdictColor(result.verdict),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = stressSummary(result),
+                        modifier = Modifier.weight(1f),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = colors.onSurface,
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Пиковый способ пока живёт только в этом тесте. Скан " +
+                        "продолжает использовать локальный фон; включаем пиковый " +
+                        "только после вашего одобрения.",
+                    fontSize = 10.sp,
+                    lineHeight = 14.sp,
+                    color = colors.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StressCaseRow(case: StyleStressLab.CaseResult) {
+    val colors = MaterialTheme.colorScheme
+    val winner = when {
+        !case.passed -> "риск"
+        case.peakError < case.localError -> "пик лучше"
+        else -> "скан лучше"
+    }
+    val winnerTint = when {
+        !case.passed -> colors.error
+        case.peakError < case.localError -> colors.primary
+        else -> colors.onSurfaceVariant
+    }
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = case.title,
+                modifier = Modifier.weight(1f),
+                fontSize = 11.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = colors.onSurface,
+            )
+            Text(
+                text = winner,
+                fontSize = 9.5.sp,
+                fontFamily = FontFamily.Monospace,
+                color = winnerTint,
+            )
+        }
+        Text(
+            text = case.detail,
+            fontSize = 10.sp,
+            lineHeight = 14.sp,
+            color = colors.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(5.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            StressMetric(
+                label = "общий фон",
+                value = case.globalError,
+                highlighted = false,
+                modifier = Modifier.weight(1f),
+            )
+            StressMetric(
+                label = "локально · скан",
+                value = case.localError,
+                highlighted = case.localError <= case.peakError,
+                modifier = Modifier.weight(1f),
+            )
+            StressMetric(
+                label = "пик · тест",
+                value = case.peakError,
+                highlighted = case.peakError < case.localError,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun StressMetric(
+    label: String,
+    value: Float,
+    highlighted: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val colors = MaterialTheme.colorScheme
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(7.dp))
+            .background(
+                if (highlighted) {
+                    colors.primary.copy(alpha = 0.12f)
+                } else {
+                    colors.surfaceVariant.copy(alpha = 0.42f)
+                },
+            )
+            .padding(horizontal = 7.dp, vertical = 5.dp),
+    ) {
+        Text(
+            text = formatPercent(value),
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold,
+            color = if (highlighted) colors.primary else colors.onSurface,
+        )
+        Text(
+            text = label,
+            fontSize = 8.5.sp,
+            color = colors.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun StressVerdictBadge(verdict: StyleStressLab.Verdict) {
+    val colors = MaterialTheme.colorScheme
+    val tint = verdictColor(verdict)
+    val label = when (verdict) {
+        StyleStressLab.Verdict.PASS -> "стабильно"
+        StyleStressLab.Verdict.MIXED -> "частично"
+        StyleStressLab.Verdict.FAIL -> "риск"
+    }
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(tint.copy(alpha = 0.13f))
+            .padding(horizontal = 7.dp, vertical = 3.dp),
+    ) {
+        Text(
+            text = label,
+            fontSize = 9.5.sp,
+            fontFamily = FontFamily.Monospace,
+            color = tint,
+        )
+    }
+}
+
+@Composable
+private fun verdictColor(verdict: StyleStressLab.Verdict): Color = when (verdict) {
+    StyleStressLab.Verdict.PASS -> MaterialTheme.colorScheme.primary
+    StyleStressLab.Verdict.MIXED -> MaterialTheme.colorScheme.tertiary
+    StyleStressLab.Verdict.FAIL -> MaterialTheme.colorScheme.error
+}
+
+private fun stressSummary(report: StyleStressLab.Report): String {
+    val base = "В допуске ${report.passedCount} из ${report.cases.size} кейсов"
+    return if (report.peakWins > 0) {
+        "$base · пиковый сэмплер точнее в ${report.peakWins}"
+    } else {
+        base
     }
 }
 

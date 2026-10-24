@@ -3,8 +3,9 @@
 
 The pages are deterministic. They are deliberately difficult: text colour
 changes smoothly across glyphs, backgrounds are noisy gradients with bokeh,
-and some small print sits on low-contrast stains. These are the cases that
-expose colour-transfer and background-restoration mistakes.
+some small print sits on low-contrast stains, one page is defocused and one
+is washed out by a highlight. These are the cases that expose colour-transfer
+and background-restoration mistakes.
 
 Usage:
     python tools/lab/generate_complex_pages.py
@@ -570,6 +571,204 @@ def sign_ja(out: Path, seed: int) -> Image.Image:
     return page
 
 
+def blur_ru(out: Path, seed: int) -> Image.Image:
+    size = (1200, 1600)
+    page = background(
+        size,
+        [
+            (0.0, (18, 24, 34)),
+            (0.45, (44, 28, 46)),
+            (0.8, (86, 44, 32)),
+            (1.0, (20, 30, 40)),
+        ],
+        seed,
+        bokeh=True,
+        streaks=True,
+    )
+    draw_text(
+        page,
+        text_mask(size, (78, 152), "НОЧНОЙ\nМАРКЕТ", font(ARIAL_BOLD, 132), spacing=4),
+        [
+            (0.0, (255, 214, 132)),
+            (0.45, (255, 116, 96)),
+            (1.0, (176, 132, 255)),
+        ],
+        shadow=(6, 8, 16, 0.62),
+    )
+    draw_text(
+        page,
+        text_mask(size, (84, 486), "еда · музыка · ремесло", font(ARIAL, 46)),
+        [(0.0, (160, 248, 226)), (0.55, (238, 244, 255)), (1.0, (255, 198, 168))],
+        shadow=(3, 4, 8, 0.5),
+    )
+    body_font = font(ARIAL, 30)
+    body_text = (
+        "Снимок сделан на бегу: резкость потеряна, штрихи расплылись, "
+        "а подсветка вытянула цвет из середины букв.\n"
+        "Строка ниже проверяет, удержится ли градиент на замыленных глифах "
+        "и не перепутается ли он с тёплым фоном.\n"
+        "Второй абзац нужен, чтобы у символов было меньше полностью "
+        "покрытых пикселей.\n"
+        "Проверка мелкого кегля: билеты, время и адрес площадки."
+    )
+    draw_text(
+        page,
+        text_mask(size, (84, 590), "\n".join(wrap(body_text, body_font, 980)), body_font, spacing=16),
+        [
+            (0.0, (244, 236, 220)),
+            (0.4, (212, 228, 248)),
+            (0.75, (236, 214, 236)),
+            (1.0, (198, 208, 255)),
+        ],
+        shadow=(2, 3, 6, 0.42),
+    )
+    draw_text(
+        page,
+        text_mask(size, (84, 982), "12—14 ИЮЛЯ · ВХОД СВОБОДНЫЙ", font(ARIAL_BOLD, 27), tracking=2),
+        [(0.0, (176, 246, 226)), (1.0, (255, 226, 178))],
+        shadow=None,
+    )
+    # Defocus plus sensor grain: text and surface lose sharpness together,
+    # exactly what a handheld photo in low light looks like.
+    page = page.filter(ImageFilter.GaussianBlur(2.6))
+    grain = Image.effect_noise(size, 26).convert("L")
+    page = Image.blend(page, Image.merge("RGB", (grain, grain, grain)), 0.035)
+    return page
+
+
+def overexposure_ru(out: Path, seed: int) -> Image.Image:
+    size = (1200, 1600)
+    page = background(
+        size,
+        [
+            (0.0, (58, 70, 62)),
+            (0.5, (128, 112, 78)),
+            (1.0, (72, 58, 52)),
+        ],
+        seed,
+        bokeh=True,
+        streaks=True,
+    )
+    draw_text(
+        page,
+        text_mask(size, (84, 140), "ЛЕТО В ГОРОДЕ", font(ARIAL_BOLD, 92)),
+        [
+            (0.0, (92, 116, 64)),
+            (0.5, (128, 84, 48)),
+            (1.0, (72, 96, 104)),
+        ],
+        shadow=(3, 4, 8, 0.4),
+    )
+    draw_text(
+        page,
+        text_mask(size, (88, 268), "открытая сцена у воды", font(ARIAL, 40)),
+        [(0.0, (86, 112, 88)), (1.0, (110, 92, 74))],
+        shadow=None,
+    )
+    body_font = font(ARIAL, 31)
+    body_text = (
+        "Солнце бьёт в объектив: часть надписи выжигается до белого, "
+        "и от чернил остаётся только слабый след.\n"
+        "Между строк всё ещё виден градиент, но его насыщенность падает "
+        "вместе с контрастом.\n"
+        "Начало программы в 18:00, сбор гостей за час до открытия.\n"
+        "Адрес площадки указан в билете и на сайте фестиваля."
+    )
+    draw_text(
+        page,
+        text_mask(size, (88, 360), "\n".join(wrap(body_text, body_font, 970)), body_font, spacing=17),
+        [
+            (0.0, (58, 66, 52)),
+            (0.4, (76, 62, 40)),
+            (0.8, (48, 58, 68)),
+            (1.0, (66, 48, 44)),
+        ],
+        shadow=None,
+    )
+    draw_text(
+        page,
+        text_mask(size, (88, 700), "ВХОД ПО РЕГИСТРАЦИИ", font(ARIAL_BOLD, 32), tracking=3),
+        [(0.0, (52, 66, 58)), (1.0, (70, 52, 44))],
+        shadow=None,
+    )
+
+    def glare_mask(center: tuple[int, int], radii: tuple[int, int], strength: float, blur: int) -> Image.Image:
+        mask = Image.new("L", size, 0)
+        cx, cy = center
+        rx, ry = radii
+        ImageDraw.Draw(mask).ellipse((cx - rx, cy - ry, cx + rx, cy + ry), fill=255)
+        mask = mask.filter(ImageFilter.GaussianBlur(blur))
+        return mask.point(lambda value: min(255, round(value * strength)))
+
+    page = Image.composite(
+        Image.new("RGB", size, (255, 253, 246)),
+        page,
+        glare_mask((700, 380), (520, 300), 0.86, 150),
+    )
+    page = Image.composite(
+        Image.new("RGB", size, (255, 255, 250)),
+        page,
+        glare_mask((860, 520), (210, 150), 0.97, 90),
+    )
+    return page
+
+
+def low_contrast_en(out: Path, seed: int) -> Image.Image:
+    size = (1200, 1600)
+    page = background(
+        size,
+        [
+            (0.0, (148, 146, 136)),
+            (0.5, (178, 172, 154)),
+            (1.0, (136, 148, 144)),
+        ],
+        seed,
+        bokeh=False,
+        streaks=True,
+    )
+    draw_text(
+        page,
+        text_mask(size, (104, 154), "Field Notes", font(GEORGIA_BOLD, 84)),
+        [(0.0, (132, 134, 124)), (0.55, (146, 140, 128)), (1.0, (124, 132, 132))],
+        shadow=None,
+    )
+    draw_text(
+        page,
+        text_mask(size, (108, 280), "Coastal station · autumn log", font(ARIAL, 34)),
+        [(0.0, (142, 142, 132)), (1.0, (134, 140, 136))],
+        shadow=None,
+    )
+    body_font = font(ARIAL, 29)
+    body_text = (
+        "The ink here sits only a few steps away from the paper. A careless "
+        "sampler will drift into the background and repaint the line in the "
+        "wrong shade.\n"
+        "Readings were taken at dusk, when the light flattened every edge and "
+        "the page turned almost uniform.\n"
+        "The second column keeps a slightly darker tone so the difference is "
+        "visible in a side-by-side comparison.\n"
+        "Archive copy · box 14 · shelf 3"
+    )
+    draw_text(
+        page,
+        text_mask(size, (108, 360), "\n".join(wrap(body_text, body_font, 960)), body_font, spacing=16),
+        [
+            (0.0, (140, 138, 128)),
+            (0.35, (130, 136, 130)),
+            (0.7, (148, 140, 130)),
+            (1.0, (128, 134, 136)),
+        ],
+        shadow=None,
+    )
+    draw_text(
+        page,
+        text_mask(size, (108, 760), "CONTROL LINE · DARKER INK", font(ARIAL_BOLD, 26), tracking=2),
+        [(0.0, (84, 90, 88)), (1.0, (72, 82, 86))],
+        shadow=None,
+    )
+    return page
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=Path("tools/lab/pages"))
@@ -581,6 +780,9 @@ def main() -> None:
         ("01_poster_ru_gradient.jpg", poster_ru, args.seed),
         ("02_document_en_gradient.jpg", document_en, args.seed + 1),
         ("03_sign_ja_gradient.jpg", sign_ja, args.seed + 2),
+        ("04_blur_ru.jpg", blur_ru, args.seed + 3),
+        ("05_overexposure_ru.jpg", overexposure_ru, args.seed + 4),
+        ("06_low_contrast_en.jpg", low_contrast_en, args.seed + 5),
     )
     for name, builder, seed in pages:
         page = builder(args.out / name, seed)

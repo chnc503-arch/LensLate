@@ -470,6 +470,7 @@ fun LensLateApp(
                     onProtectEmbeddedImages = viewModel::setProtectEmbeddedImages,
                     onAggressiveSanitizer = viewModel::setAggressiveSanitizer,
                     onPreviewProtection = viewModel::previewProtectionMap,
+                    onRunStyleStress = viewModel::runStyleStressTest,
                 )
             }
         }
