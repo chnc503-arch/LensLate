@@ -74,4 +74,36 @@ class StyleGradientTest {
         assertFalse(StyleGradient.hasScaleDrift(listOf(TextStyleSample(scale = 1.01f))))
         assertTrue(StyleGradient.hasScaleDrift(listOf(TextStyleSample(scale = 1.08f))))
     }
+
+    @Test
+    fun smoothGradientIsNotMistakenForAnAccentWord() {
+        val gradient = (0..8).map { step ->
+            TextStyleSample(
+                color = StyleGradient.lerpColor(
+                    0xFFE6283C.toInt(),
+                    0xFF2855FF.toInt(),
+                    step / 8f,
+                ),
+            )
+        }
+        assertTrue(StyleGradient.looksLikeGradient(gradient))
+    }
+
+    @Test
+    fun accentWordFollowedByUniformBodyIsNotAGradient() {
+        val samples = List(10) { index ->
+            TextStyleSample(if (index < 2) 0xFFE6283C.toInt() else 0xFF202020.toInt())
+        }
+        assertFalse(StyleGradient.looksLikeGradient(samples))
+    }
+
+    @Test
+    fun uniformLineAndTooFewSamplesAreNotGradients() {
+        assertFalse(StyleGradient.looksLikeGradient(List(10) { TextStyleSample(dark) }))
+        assertFalse(
+            StyleGradient.looksLikeGradient(
+                listOf(TextStyleSample(red), TextStyleSample(0xFF2855FF.toInt())),
+            ),
+        )
+    }
 }

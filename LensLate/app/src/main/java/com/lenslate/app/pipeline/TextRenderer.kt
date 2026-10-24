@@ -959,6 +959,9 @@ class TextRenderer @Inject constructor() {
      */
     private fun accentPrefixColor(samples: List<TextStyleSample>, fallback: Int): Int? {
         if (samples.size < MIN_ACCENT_SAMPLES) return null
+        // A smoothly drifting line is a designed gradient, not an accent word;
+        // collapsing its first word to one colour would destroy the effect.
+        if (StyleGradient.looksLikeGradient(samples)) return null
         val first = samples.first().color ?: return null
         if (colorDisparity(first, fallback) < MIN_ACCENT_DISPARITY) return null
         val limit = (samples.size * MAX_ACCENT_PREFIX_SHARE).toInt().coerceAtLeast(1)

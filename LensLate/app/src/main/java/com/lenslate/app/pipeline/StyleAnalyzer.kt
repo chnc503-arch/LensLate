@@ -14,6 +14,7 @@ import kotlin.math.abs
 import kotlin.math.atan
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 data class RegionStyleAnalysis(
@@ -221,42 +222,54 @@ class StyleAnalyzer @Inject constructor() {
     ): Int {
         val bounds = clampRect(unitBounds.toRect(), bitmap)
         if (bounds.width() < 2 || bounds.height() < 2) return fallbackColor
-        val width = bounds.width()
-        val height = bounds.height()
-        val inset = if (width > 4 && height > 4) 1 else 0
-        val sampleWidth = (width - inset * 2).coerceAtLeast(1)
-        val sampleHeight = (height - inset * 2).coerceAtLeast(1)
+        // A narrow strip above and below the glyph measures the backdrop where
+        // that glyph actually sits. On a gradient or textured poster the
+        // paragraph-wide median is wrong for most of the line, and the glyph's
+        // own background then counts as ink.
+        val pad = (bounds.height() * LOCAL_BACKDROP_STRIP_RATIO)
+            .roundToInt()
+            .coerceIn(MIN_LOCAL_STRIP_PAD, MAX_LOCAL_STRIP_PAD)
+        val topPad = min(pad, bounds.top)
+        val bottomPad = min(pad, bitmap.height - bounds.bottom)
+        val sampleWidth = bounds.width()
+        val sampleHeight = bounds.height() + topPad + bottomPad
+        if (sampleWidth < 2 || sampleHeight <= 0) return fallbackColor
         val pixels = IntArray(sampleWidth * sampleHeight)
         try {
             bitmap.getPixels(
                 pixels,
                 0,
                 sampleWidth,
-                bounds.left + inset,
-                bounds.top + inset,
+                bounds.left,
+                bounds.top - topPad,
                 sampleWidth,
                 sampleHeight,
             )
         } catch (_: IllegalArgumentException) {
             return fallbackColor
         }
-        val distances = FloatArray(pixels.size)
-        var maximumDistance = 0f
-        pixels.forEachIndexed { index, pixel ->
-            if (Color.alpha(pixel) < MIN_CHARACTER_ALPHA) return@forEachIndexed
-            val distance = colorDistanceSq(pixel, background)
-            distances[index] = distance
-            if (distance > maximumDistance) maximumDistance = distance
-        }
-        if (maximumDistance < MIN_CHARACTER_DISTANCE) return fallbackColor
-        // Only the most saturated core of the glyph represents its ink;
-        // anti-aliased edge pixels are a blend with the background.
-        val threshold = max(MIN_CHARACTER_DISTANCE, maximumDistance * CHARACTER_STRONG_RATIO)
-        val candidates = ArrayList<Int>(pixels.size / 3)
-        pixels.forEachIndexed { index, pixel ->
-            if (distances[index] >= threshold) candidates += pixel
-        }
-        return if (candidates.isEmpty()) fallbackColor else medianColor(candidates)
+        val backdrop = InkColorSampler.estimateBackdrop(
+            topStrip = rows(pixels, sampleWidth, 0, topPad),
+            bottomStrip = rows(pixels, sampleWidth, sampleHeight - bottomPad, bottomPad),
+            globalBackground = background,
+            inkColor = fallbackColor,
+        )
+        return InkColorSampler.sampleGlyphColor(
+            pixels = pixels,
+            width = sampleWidth,
+            glyphTop = topPad,
+            glyphBottom = topPad + bounds.height(),
+            backdrop = backdrop,
+            fallbackInk = fallbackColor,
+        )
+    }
+
+    private fun rows(pixels: IntArray, width: Int, startRow: Int, rowCount: Int): IntArray {
+        if (rowCount <= 0 || width <= 0) return IntArray(0)
+        val start = startRow * width
+        val end = (startRow + rowCount) * width
+        if (start < 0 || end > pixels.size) return IntArray(0)
+        return pixels.copyOfRange(start, end)
     }
 
     /** Линейный тренд высоты внутри классов глифов; шум формы в перевод не попадает. */
@@ -886,9 +899,9 @@ class StyleAnalyzer @Inject constructor() {
         const val MIN_INK_DISTANCE = 0.03f
         const val INK_THRESHOLD_RATIO = 0.35f
         const val STRONG_INK_RATIO = 0.55f
-        const val CHARACTER_STRONG_RATIO = 0.62f
-        const val MIN_CHARACTER_DISTANCE = 0.045f
-        const val MIN_CHARACTER_ALPHA = 40
+        const val LOCAL_BACKDROP_STRIP_RATIO = 0.30f
+        const val MIN_LOCAL_STRIP_PAD = 2
+        const val MAX_LOCAL_STRIP_PAD = 10
         const val MIN_FONT_MATCH_CAP_HEIGHT = 4f
         const val MIN_FONT_MATCH_LETTERS = 2
         const val REPRESENTATIVE_LETTERS = 26

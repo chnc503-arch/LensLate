@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+"""Generate hard LensLate test pages: textured backgrounds and gradient text.
+
+The pages are deterministic. They are deliberately difficult: text colour
+changes smoothly across glyphs, backgrounds are noisy gradients with bokeh,
+and some small print sits on low-contrast stains. These are the cases that
+expose colour-transfer and background-restoration mistakes.
+
+Usage:
+    python tools/lab/generate_complex_pages.py
+    python tools/lab/generate_complex_pages.py --out tools/lab/pages
+
+Fonts are taken from the Windows font directory by default; override with
+LENSLATE_FONT_DIR. The generated JPEGs are checked into the repository so the
+fixtures stay stable even on machines without these fonts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import random
+from pathlib import Path
+
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+
+FONT_DIR = Path(os.environ.get("LENSLATE_FONT_DIR", Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"))
+ARIAL = FONT_DIR / "arial.ttf"
+ARIAL_BOLD = FONT_DIR / "arialbd.ttf"
+GEORGIA_BOLD = FONT_DIR / "georgiab.ttf"
+YU_GOTHIC = FONT_DIR / "YuGothR.ttc"
+YU_GOTHIC_BOLD = FONT_DIR / "YuGothB.ttc"
+
+Rgb = tuple[int, int, int]
+Stops = list[tuple[float, Rgb]]
+
+
+def font(path: Path, size: int) -> ImageFont.FreeTypeFont:
+    if not path.exists():
+        raise SystemExit(f"Font not found: {path}. Set LENSLATE_FONT_DIR or edit the constants.")
+    return ImageFont.truetype(str(path), size)
+
+
+def sample_stops(stops: Stops, t: float) -> Rgb:
+    if t <= stops[0][0]:
+        return stops[0][1]
+    for (p0, c0), (p1, c1) in zip(stops, stops[1:]):
+        if t <= p1:
+            f = (t - p0) / max(1e-6, p1 - p0)
+            return tuple(round(c0[i] + (c1[i] - c0[i]) * f) for i in range(3))  # type: ignore[return-value]
+    return stops[-1][1]
+
+
+def gradient_image(size: tuple[int, int], stops: Stops, axis: str = "x") -> Image.Image:
+    w, h = size
+    if axis == "y":
+        strip = Image.new("RGB", (1, h))
+        pixels = strip.load()
+        for y in range(h):
+            pixels[0, y] = sample_stops(stops, y / max(1, h - 1))
+    else:
+        strip = Image.new("RGB", (w, 1))
+        pixels = strip.load()
+        for x in range(w):
+            pixels[x, 0] = sample_stops(stops, x / max(1, w - 1))
+    return strip.resize(size, Image.Resampling.BILINEAR)
+
+
+def background(size: tuple[int, int], stops: Stops, seed: int, bokeh: bool, streaks: bool) -> Image.Image:
+    w, h = size
+    base = gradient_image(size, stops, axis="x")
+
+    # Low-frequency mottling plus fine grain: a photo-like surface rather than
+    # a clean digital gradient.
+    small = (max(2, w // 28), max(2, h // 28))
+    mottle = Image.effect_noise(small, 95).resize(size, Image.Resampling.BICUBIC)
+    mottle = mottle.filter(ImageFilter.GaussianBlur(w * 0.006))
+    mottle_rgb = Image.merge("RGB", (mottle, mottle, mottle))
+    base = Image.blend(base, ImageChops.overlay(base, mottle_rgb), 0.35)
+
+    grain = Image.effect_noise(size, 30).convert("L")
+    grain_rgb = Image.merge("RGB", (grain, grain, grain))
+    base = Image.blend(base, grain_rgb, 0.045)
+
+    if bokeh:
+        glow = Image.new("RGBA", size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(glow)
+        rnd = random.Random(seed + 1)
+        palette = [
+            (255, 176, 92),
+            (86, 220, 207),
+            (236, 86, 168),
+            (132, 126, 255),
+            (255, 226, 150),
+        ]
+        for _ in range(16):
+            x = rnd.randint(-w // 8, w + w // 8)
+            y = rnd.randint(-h // 8, h + h // 8)
+            radius = rnd.randint(w // 24, w // 7)
+            color = rnd.choice(palette)
+            draw.ellipse(
+                (x - radius, y - radius, x + radius, y + radius),
+                fill=color + (rnd.randint(18, 46),),
+            )
+        glow = glow.filter(ImageFilter.GaussianBlur(w * 0.022))
+        base = Image.alpha_composite(base.convert("RGBA"), glow).convert("RGB")
+
+    if streaks:
+        streak = Image.new("RGBA", size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(streak)
+        rnd = random.Random(seed + 2)
+        for _ in range(5):
+            x = rnd.randint(-w // 3, w)
+            width = rnd.randint(w // 40, w // 12)
+            draw.polygon(
+                [(x, 0), (x + width, 0), (x + width + h * 0.6, h), (x + h * 0.6, h)],
+                fill=(255, 244, 220, rnd.randint(10, 26)),
+            )
+        streak = streak.filter(ImageFilter.GaussianBlur(w * 0.02))
+        base = Image.alpha_composite(base.convert("RGBA"), streak).convert("RGB")
+
+    # Vignette keeps the eye (and text) around the centre.
+    mask = Image.new("L", size, 0)
+    ImageDraw.Draw(mask).ellipse((-w * 0.18, -h * 0.18, w * 1.18, h * 1.18), fill=255)
+    mask = mask.filter(ImageFilter.GaussianBlur(w * 0.09))
+    base = Image.composite(base, Image.new("RGB", size, (0, 0, 0)), mask)
+    return base
+
+
+def text_mask(
+    size: tuple[int, int],
+    xy: tuple[int, int],
+    text: str,
+    typeface: ImageFont.FreeTypeFont,
+    spacing: int = 0,
+    tracking: int = 0,
+) -> Image.Image:
+    mask = Image.new("L", size, 0)
+    if tracking:
+        x, y = xy
+        for line in text.split("\n"):
+            cursor = x
+            for character in line:
+                ImageDraw.Draw(mask).text((cursor, y), character, font=typeface, fill=255)
+                cursor += round(typeface.getlength(character)) + tracking
+            y += typeface.size + spacing
+        return mask
+    ImageDraw.Draw(mask).multiline_text(
+        xy,
+        text,
+        font=typeface,
+        fill=255,
+        spacing=spacing,
+        align="left",
+    )
+    return mask
+
+
+def draw_text(
+    base: Image.Image,
+    mask: Image.Image,
+    stops: Stops,
+    axis: str = "x",
+    shadow: tuple[int, int, int, float] | None = (6, 9, 12, 0.62),
+    glow: tuple[Rgb, float, int] | None = None,
+) -> None:
+    size = base.size
+    if glow:
+        color, strength, blur = glow
+        glow_mask = mask.filter(ImageFilter.GaussianBlur(blur)).point(
+            lambda value: min(255, round(value * strength))
+        )
+        layer = Image.new("RGB", size, (0, 0, 0))
+        layer.paste(Image.new("RGB", size, color), (0, 0), glow_mask)
+        base.paste(ImageChops.add(base, layer))
+    if shadow:
+        dx, dy, blur, opacity = shadow
+        blurred = mask.filter(ImageFilter.GaussianBlur(blur)).point(
+            lambda value: min(255, round(value * opacity))
+        )
+        shifted = Image.new("L", size, 0)
+        shifted.paste(blurred, (dx, dy))
+        base.paste(Image.new("RGB", size, (8, 6, 10)), (0, 0), shifted)
+    fill = gradient_image(size, stops, axis=axis)
+    base.paste(fill, (0, 0), mask)
+
+
+def wrap(text: str, typeface: ImageFont.FreeTypeFont, width: int) -> list[str]:
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        current = ""
+        for word in paragraph.split():
+            candidate = f"{current} {word}".strip()
+            if not current or typeface.getlength(candidate) <= width:
+                current = candidate
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+    return lines
+
+
+def translucent_panel(
+    base: Image.Image,
+    box: tuple[int, int, int, int],
+    color: tuple[int, int, int],
+    opacity: int,
+    radius: int = 28,
+    blur: int = 0,
+) -> None:
+    layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    ImageDraw.Draw(layer).rounded_rectangle(box, radius=radius, fill=color + (opacity,))
+    if blur:
+        layer = layer.filter(ImageFilter.GaussianBlur(blur))
+    base.paste(Image.alpha_composite(base.convert("RGBA"), layer).convert("RGB"))
+
+
+def poster_ru(out: Path, seed: int) -> Image.Image:
+    size = (1200, 1600)
+    page = background(
+        size,
+        [
+            (0.0, (16, 30, 42)),
+            (0.42, (58, 22, 52)),
+            (0.78, (128, 58, 36)),
+            (1.0, (24, 48, 56)),
+        ],
+        seed,
+        bokeh=True,
+        streaks=True,
+    )
+
+    draw_text(
+        page,
+        text_mask(size, (86, 132), "СЕЗОН 2026", font(ARIAL_BOLD, 38), tracking=9),
+        [(0.0, (255, 226, 150)), (1.0, (120, 240, 224))],
+        shadow=(3, 4, 8, 0.5),
+    )
+
+    headline = text_mask(
+        size,
+        (72, 240),
+        "ЛЕТНИЙ\nФЕСТИВАЛЬ",
+        font(ARIAL_BOLD, 148),
+        spacing=6,
+    )
+    draw_text(
+        page,
+        headline,
+        [
+            (0.0, (255, 205, 86)),
+            (0.38, (255, 106, 92)),
+            (0.7, (238, 70, 156)),
+            (1.0, (126, 82, 255)),
+        ],
+        shadow=(8, 11, 18, 0.7),
+        glow=((255, 110, 120), 0.28, 26),
+    )
+
+    draw_text(
+        page,
+        text_mask(size, (84, 640), "музыка · еда · искусство", font(ARIAL, 52)),
+        [(0.0, (196, 255, 238)), (0.55, (255, 255, 245)), (1.0, (142, 224, 255))],
+        shadow=(4, 5, 9, 0.55),
+    )
+    draw_text(
+        page,
+        text_mask(size, (84, 724), "12—14 ИЮЛЯ  •  ПАРК ГОРЬКОГО", font(ARIAL_BOLD, 34)),
+        [(0.0, (255, 224, 150)), (1.0, (255, 126, 100))],
+        shadow=(3, 4, 7, 0.55),
+    )
+
+    translucent_panel(page, (74, 840, 1126, 1236), (10, 16, 24), 150, radius=34, blur=2)
+    body_font = font(ARIAL, 31)
+    body_text = (
+        "Три дня живой музыки, уличной еды и современного искусства.\n"
+        "Сцена у воды, ночной маркет и кинопоказ под открытым небом.\n"
+        "Вход по билетам, дети до семи лет — бесплатно.\n"
+        "Программа обновляется каждый день на сайте фестиваля."
+    )
+    body_lines = wrap(body_text, body_font, 980)
+    body = "\n".join(body_lines)
+    draw_text(
+        page,
+        text_mask(size, (116, 884), body, body_font, spacing=18),
+        [
+            (0.0, (246, 238, 224)),
+            (0.45, (220, 232, 246)),
+            (0.75, (238, 220, 236)),
+            (1.0, (206, 214, 255)),
+        ],
+        shadow=(2, 3, 5, 0.4),
+    )
+
+    draw_text(
+        page,
+        text_mask(size, (84, 1300), "LIVE MUSIC  •  20:00", font(ARIAL_BOLD, 30)),
+        [(0.0, (174, 255, 238)), (1.0, (255, 255, 255))],
+        shadow=(3, 4, 8, 0.6),
+    )
+
+    draw_text(
+        page,
+        text_mask(size, (84, 1460), "БИЛЕТЫ НА САЙТЕ FESTIVAL.RU", font(ARIAL, 26), tracking=3),
+        [(0.0, (176, 190, 186)), (1.0, (140, 170, 168))],
+        shadow=None,
+    )
+
+    badge = Image.new("RGBA", size, (0, 0, 0, 0))
+    badge_draw = ImageDraw.Draw(badge)
+    badge_draw.ellipse((936, 1286, 1104, 1454), outline=(255, 214, 140, 190), width=4)
+    badge_draw.ellipse((958, 1308, 1082, 1432), outline=(120, 224, 214, 140), width=2)
+    page.paste(Image.alpha_composite(page.convert("RGBA"), badge).convert("RGB"))
+    draw_text(
+        page,
+        text_mask(size, (984, 1348), "2026", font(ARIAL_BOLD, 40)),
+        [(0.0, (255, 232, 168)), (1.0, (140, 238, 226))],
+        shadow=(2, 3, 6, 0.5),
+    )
+    return page
+
+
+def document_en(out: Path, seed: int) -> Image.Image:
+    size = (1200, 1600)
+    page = background(
+        size,
+        [
+            (0.0, (232, 226, 210)),
+            (0.5, (246, 241, 226)),
+            (1.0, (208, 214, 210)),
+        ],
+        seed,
+        bokeh=False,
+        streaks=True,
+    )
+    # Paper fibres and a couple of soft stains.
+    stains = Image.new("RGBA", size, (0, 0, 0, 0))
+    stain_draw = ImageDraw.Draw(stains)
+    for x, y, radius, color, alpha in (
+        (940, 260, 160, (196, 168, 112), 30),
+        (240, 1180, 210, (138, 158, 152), 24),
+        (1060, 1320, 130, (176, 128, 96), 22),
+    ):
+        stain_draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color + (alpha,))
+    stains = stains.filter(ImageFilter.GaussianBlur(48))
+    page = Image.alpha_composite(page.convert("RGBA"), stains).convert("RGB")
+    # Soft paper edge shadow.
+    edge = Image.new("L", size, 0)
+    ImageDraw.Draw(edge).rectangle((28, 24, 1172, 1576), fill=255)
+    edge = edge.filter(ImageFilter.GaussianBlur(28))
+    page.paste(Image.new("RGB", size, (90, 82, 68)), (0, 0), ImageChops.invert(edge).point(lambda v: v // 3))
+
+    draw_text(
+        page,
+        text_mask(size, (108, 128), "Northwind Field Notes", font(GEORGIA_BOLD, 66)),
+        [(0.0, (20, 58, 42)), (0.55, (10, 86, 94)), (1.0, (22, 42, 92))],
+        shadow=None,
+    )
+    draw_text(
+        page,
+        text_mask(size, (112, 214), "Seasonal observations from the coastal station", font(ARIAL, 27)),
+        [(0.0, (88, 92, 84)), (1.0, (78, 98, 102))],
+        shadow=None,
+    )
+
+    prefix_font = font(ARIAL_BOLD, 32)
+    prefix = "IMPORTANT:"
+    prefix_x, prefix_y = 112, 292
+    draw_text(
+        page,
+        text_mask(size, (prefix_x, prefix_y), prefix, prefix_font),
+        [(0.0, (198, 28, 42)), (0.5, (226, 46, 74)), (1.0, (152, 20, 58))],
+        shadow=None,
+    )
+    rest_x = prefix_x + round(prefix_font.getlength(prefix)) + 12
+    draw_text(
+        page,
+        text_mask(size, (rest_x, prefix_y), "read before deployment", font(ARIAL, 32)),
+        [(0.0, (46, 48, 52)), (1.0, (72, 64, 58))],
+        shadow=None,
+    )
+
+    body_font = font(ARIAL, 28)
+    body_text = (
+        "The station logged a steady shift in wind direction after the equinox. "
+        "Surface temperatures remained within the expected range, while the "
+        "southern channel cleared earlier than in previous years.\n\n"
+        "Two independent readings were taken at each marker. Where they "
+        "disagreed, the crew repeated the measurement at first light and kept "
+        "the median value. The raw notes are archived in the field cabinet."
+    )
+    lines = wrap(body_text, body_font, 930)
+    draw_text(
+        page,
+        text_mask(size, (112, 356), "\n".join(lines), body_font, spacing=15),
+        [
+            (0.0, (34, 44, 58)),
+            (0.45, (42, 54, 76)),
+            (0.8, (58, 46, 68)),
+            (1.0, (66, 42, 54)),
+        ],
+        shadow=None,
+    )
+
+    table_font = font(ARIAL, 26)
+    table_bold = font(ARIAL_BOLD, 26)
+    table_top = 880
+    draw_text(
+        page,
+        text_mask(size, (116, table_top), "SITE", table_bold),
+        [(0.0, (32, 48, 52)), (1.0, (48, 52, 62))],
+        shadow=None,
+    )
+    draw_text(
+        page,
+        text_mask(size, (470, table_top), "READING", table_bold),
+        [(0.0, (32, 48, 52)), (1.0, (48, 52, 62))],
+        shadow=None,
+    )
+    draw_text(
+        page,
+        text_mask(size, (860, table_top), "STATUS", table_bold),
+        [(0.0, (32, 48, 52)), (1.0, (48, 52, 62))],
+        shadow=None,
+    )
+    rows = (
+        ("N-01", "14.8 °C", "stable"),
+        ("N-02", "15.1 °C", "rising"),
+        ("N-03", "14.6 °C", "stable"),
+        ("S-07", "16.2 °C", "cleared"),
+    )
+    grid = ImageDraw.Draw(page)
+    grid.line((112, table_top + 42, 1088, table_top + 42), fill=(118, 112, 100), width=2)
+    for index, (site, reading, status) in enumerate(rows):
+        y = table_top + 64 + index * 52
+        for x, value, typeface in (
+            (116, site, table_font),
+            (470, reading, table_font),
+            (860, status, table_font),
+        ):
+            draw_text(
+                page,
+                text_mask(size, (x, y), value, typeface),
+                [(0.0, (54, 58, 62)), (1.0, (62, 58, 70))],
+                shadow=None,
+            )
+        grid.line((112, y + 38, 1088, y + 38), fill=(202, 196, 182), width=1)
+
+    draw_text(
+        page,
+        text_mask(size, (112, 1268), "Модель ЬХ—4200  ·  Серия А  ·  2026", font(ARIAL, 21)),
+        [(0.0, (118, 112, 102)), (1.0, (136, 128, 116))],
+        shadow=None,
+    )
+    draw_text(
+        page,
+        text_mask(size, (1010, 1560), "17", font(ARIAL, 24)),
+        [(0.0, (120, 116, 108)), (1.0, (140, 132, 120))],
+        shadow=None,
+    )
+    return page
+
+
+def sign_ja(out: Path, seed: int) -> Image.Image:
+    size = (1600, 1200)
+    page = background(
+        size,
+        [
+            (0.0, (8, 10, 24)),
+            (0.45, (22, 12, 38)),
+            (0.75, (42, 16, 32)),
+            (1.0, (8, 18, 30)),
+        ],
+        seed,
+        bokeh=True,
+        streaks=True,
+    )
+    # Dark shop-sign panel, softly lit.
+    translucent_panel(page, (92, 148, 1268, 900), (6, 8, 16), 168, radius=42, blur=3)
+    neon_edge = Image.new("RGBA", size, (0, 0, 0, 0))
+    ImageDraw.Draw(neon_edge).rounded_rectangle(
+        (92, 148, 1268, 900), radius=42, outline=(255, 86, 140, 115), width=3
+    )
+    neon_edge = neon_edge.filter(ImageFilter.GaussianBlur(7))
+    page = Image.alpha_composite(page.convert("RGBA"), neon_edge).convert("RGB")
+
+    draw_text(
+        page,
+        text_mask(size, (156, 208), "なつのさいでん", font(YU_GOTHIC, 44), tracking=8),
+        [(0.0, (154, 246, 255)), (1.0, (255, 196, 236))],
+        shadow=(2, 3, 6, 0.5),
+    )
+    headline = text_mask(size, (128, 296), "夏の祭典", font(YU_GOTHIC_BOLD, 196), tracking=18)
+    draw_text(
+        page,
+        headline,
+        [
+            (0.0, (255, 60, 110)),
+            (0.32, (255, 112, 96)),
+            (0.62, (255, 186, 108)),
+            (0.85, (255, 228, 168)),
+            (1.0, (255, 248, 226)),
+        ],
+        axis="x",
+        shadow=(8, 12, 20, 0.72),
+        glow=((255, 76, 132), 0.42, 30),
+    )
+    draw_text(
+        page,
+        text_mask(size, (144, 596), "SUMMER FESTIVAL 2026", font(ARIAL_BOLD, 48), tracking=5),
+        [(0.0, (132, 238, 255)), (0.5, (214, 244, 255)), (1.0, (255, 216, 158))],
+        shadow=(3, 5, 9, 0.55),
+    )
+    draw_text(
+        page,
+        text_mask(size, (144, 700), "東京・代々木公園  ·  8.12—8.14", font(YU_GOTHIC, 34)),
+        [(0.0, (196, 204, 220)), (1.0, (238, 216, 206))],
+        shadow=(2, 3, 6, 0.55),
+    )
+    draw_text(
+        page,
+        text_mask(size, (144, 790), "入場無料  ·  OPEN 18:00", font(YU_GOTHIC_BOLD, 30)),
+        [(0.0, (156, 250, 232)), (1.0, (255, 246, 206))],
+        shadow=(2, 3, 6, 0.5),
+    )
+
+    # Vertical kana column on the right: white-to-warm drift on a dark field.
+    vertical = ["入", "場", "無", "料"]
+    vertical_font = font(YU_GOTHIC_BOLD, 86)
+    y = 240
+    for index, character in enumerate(vertical):
+        draw_text(
+            page,
+            text_mask(size, (1380, y), character, vertical_font),
+            [
+                (0.0, (255, 248, 230)),
+                (0.6, (255, 214, 146)),
+                (1.0, (255, 150, 130)),
+            ],
+            axis="y",
+            shadow=(4, 6, 10, 0.62),
+        )
+        y += 118 + (6 if index == 1 else 0)
+
+    # Rotated badge: angle transfer and brightness on a busier patch.
+    badge = Image.new("RGBA", (430, 180), (0, 0, 0, 0))
+    badge_mask = Image.new("L", badge.size, 0)
+    ImageDraw.Draw(badge_mask).text(
+        (24, 34),
+        "LIVE",
+        font=font(ARIAL_BOLD, 92),
+        fill=255,
+    )
+    badge_fill = gradient_image(
+        badge.size,
+        [(0.0, (120, 246, 255)), (0.55, (255, 255, 255)), (1.0, (255, 176, 112))],
+    )
+    badge.paste(badge_fill, (0, 0), badge_mask)
+    badge = badge.rotate(-11, expand=True, resample=Image.Resampling.BICUBIC)
+    page.paste(badge, (1240, 940), badge)
+
+    # A logo-like mark with no real words; it must not produce phantom text.
+    mark = Image.new("RGBA", size, (0, 0, 0, 0))
+    mark_draw = ImageDraw.Draw(mark)
+    mark_draw.ellipse((1270, 650, 1450, 830), outline=(255, 214, 150, 160), width=4)
+    mark_draw.arc((1290, 670, 1430, 810), 200, 340, fill=(120, 240, 226, 190), width=8)
+    mark_draw.arc((1300, 680, 1420, 800), 20, 160, fill=(255, 120, 160, 150), width=5)
+    page.paste(Image.alpha_composite(page.convert("RGBA"), mark).convert("RGB"))
+    return page
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", type=Path, default=Path("tools/lab/pages"))
+    parser.add_argument("--seed", type=int, default=20261024)
+    args = parser.parse_args()
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    pages = (
+        ("01_poster_ru_gradient.jpg", poster_ru, args.seed),
+        ("02_document_en_gradient.jpg", document_en, args.seed + 1),
+        ("03_sign_ja_gradient.jpg", sign_ja, args.seed + 2),
+    )
+    for name, builder, seed in pages:
+        page = builder(args.out / name, seed)
+        path = args.out / name
+        page.convert("RGB").save(path, "JPEG", quality=88, subsampling=0, optimize=True)
+        print(f"{path}  {path.stat().st_size // 1024} KiB  {page.width}x{page.height}")
+
+
+if __name__ == "__main__":
+    main()
