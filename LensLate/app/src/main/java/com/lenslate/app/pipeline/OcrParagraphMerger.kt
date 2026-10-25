@@ -22,9 +22,11 @@ internal object OcrParagraphMerger {
         regions: List<TextRegionRecord>,
         lexical: Boolean = false,
     ): List<TextRegionRecord> {
-        if (regions.size < 2) return regions
+        if (regions.isEmpty()) return regions
+        val normalized = regions.map(::normalizeLines)
+        if (normalized.size < 2) return normalized
         val groups = mutableListOf<MutableList<TextRegionRecord>>()
-        regions
+        normalized
             .sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
             .forEach { region ->
                 val target = groups
@@ -39,10 +41,102 @@ internal object OcrParagraphMerger {
         // fragments. Those fragments would otherwise be translated and drawn on
         // top of the paragraph.
         val deduped = deduplicate(merged, lexical)
-        if (merged.size == regions.size && deduped.size == regions.size) return regions
+        if (merged.size == normalized.size && deduped.size == normalized.size) return normalized
         return deduped
             .sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
             .mapIndexed { index, region -> region.copy(id = index + 1, readingOrder = index) }
+    }
+
+    /**
+     * Independent passes attach their own line boxes to the same region. Two
+     * boxes of one physical line then look like two source lines to the renderer,
+     * which wraps a title and draws the halves over each other. Keep one box per
+     * line before any geometry decisions are made.
+     */
+    private fun normalizeLines(region: TextRegionRecord): TextRegionRecord {
+        if (region.lines.size < 2) return region
+        val kept = mutableListOf<TextLineRecord>()
+        var dropped = false
+        region.lines
+            .sortedWith(compareBy({ it.bounds?.top ?: Float.MAX_VALUE }, { it.bounds?.left ?: 0f }))
+            .forEach { line ->
+                val hostIndex = kept.indexOfFirst { existing -> isDuplicateLine(existing, line) }
+                if (hostIndex < 0) {
+                    kept += line
+                } else {
+                    dropped = true
+                    if (boxHeight(line) > boxHeight(kept[hostIndex])) kept[hostIndex] = line
+                }
+            }
+        if (!dropped) return region
+        // The dropped box may have defined the region edges (a stray sliver
+        // above a heading widened the block and shifted its frame left), so the
+        // frame must follow the lines that survived.
+        val bounds = unionBounds(kept)
+        return if (bounds == null) {
+            region.copy(lines = kept)
+        } else {
+            region.copy(lines = kept, bounds = bounds, polygon = bounds.toPolygon())
+        }
+    }
+
+    private fun isDuplicateLine(host: TextLineRecord, candidate: TextLineRecord): Boolean {
+        val first = host.bounds ?: return false
+        val second = candidate.bounds ?: return false
+        val vertical = min(first.bottom, second.bottom) - max(first.top, second.top)
+        val horizontal = min(first.right, second.right) - max(first.left, second.left)
+        val sameRow = vertical > min(first.height, second.height) * DUPLICATE_LINE_OVERLAP &&
+            horizontal > min(first.width, second.width) * DUPLICATE_LINE_OVERLAP
+        if (sameRow) {
+            if (textSimilarity(host.text, candidate.text) >= DUPLICATE_LINE_SIMILARITY) return true
+            // Two passes read one physical line in different words when the ink
+            // is faint. Boxes that start and end within a fifth of a line height
+            // of each other are that one line, whatever each pass heard.
+            val slack = min(first.height, second.height) * DUPLICATE_LINE_COORD_SLACK
+            if (abs(first.top - second.top) <= slack && abs(first.bottom - second.bottom) <= slack) {
+                return true
+            }
+        }
+        // Complementary passes can split one physical line into a full box and
+        // a thin sliver just above or below it. The sliver overlaps the host by
+        // nothing vertically, so containment alone leaves two frames for one
+        // line and the renderer squeezes the heading into them.
+        val small = min(first.height, second.height)
+        val large = max(first.height, second.height)
+        if (large <= 0f || small > large * SLIVER_MAX_HEIGHT_RATIO) return false
+        if (horizontal <= min(first.width, second.width) * DUPLICATE_LINE_OVERLAP) return false
+        val gap = max(first.top, second.top) - min(first.bottom, second.bottom)
+        if (gap > large * SLIVER_MAX_GAP_RATIO) return false
+        // A box a few pixels tall that sits on another line's rows is scanner
+        // edge noise: it cannot be a physical line even when its few characters
+        // read differently. Keeping it widened the block far to the left.
+        if (small <= large * SLIVER_IGNORE_HEIGHT_RATIO && small <= SLIVER_IGNORE_MAX_HEIGHT) {
+            return true
+        }
+        return textSimilarity(host.text, candidate.text) >= DUPLICATE_LINE_SIMILARITY
+    }
+
+    /** Adds a line unless it duplicates one already kept; keeps the taller box. */
+    private fun appendLine(lines: MutableList<TextLineRecord>, line: TextLineRecord) {
+        val hostIndex = lines.indexOfFirst { existing -> isDuplicateLine(existing, line) }
+        if (hostIndex < 0) {
+            lines += line
+        } else if (boxHeight(line) > boxHeight(lines[hostIndex])) {
+            lines[hostIndex] = line
+        }
+    }
+
+    private fun boxHeight(line: TextLineRecord): Float = line.bounds?.height ?: 0f
+
+    private fun unionBounds(lines: List<TextLineRecord>): Bounds2D? {
+        val boxes = lines.mapNotNull { it.bounds }
+        if (boxes.isEmpty()) return null
+        return Bounds2D(
+            left = boxes.minOf { it.left },
+            top = boxes.minOf { it.top },
+            right = boxes.maxOf { it.right },
+            bottom = boxes.maxOf { it.bottom },
+        )
     }
 
     private fun deduplicate(
@@ -102,17 +196,9 @@ internal object OcrParagraphMerger {
         )
         val lines = mutableListOf<TextLineRecord>()
         (host.lines + fragment.lines)
-            .mapNotNull { line -> line.bounds?.let { bounds -> line to bounds } }
-            .sortedWith(compareBy({ it.second.top }, { it.second.left }))
-            .forEach { (line, lineBounds) ->
-                val duplicate = lines.any { existing ->
-                    val existingBounds = existing.bounds ?: return@any false
-                    val overlap = min(existingBounds.bottom, lineBounds.bottom) -
-                        max(existingBounds.top, lineBounds.top)
-                    overlap > min(existingBounds.height, lineBounds.height) * ABSORB_LINE_OVERLAP
-                }
-                if (!duplicate) lines += line
-            }
+            .filter { it.bounds != null }
+            .sortedWith(compareBy({ it.bounds?.top ?: Float.MAX_VALUE }, { it.bounds?.left ?: 0f }))
+            .forEach { line -> appendLine(lines, line) }
         return host.copy(bounds = bounds, polygon = bounds.toPolygon(), lines = lines)
     }
 
@@ -274,28 +360,21 @@ internal object OcrParagraphMerger {
 
     private fun combine(group: List<TextRegionRecord>): TextRegionRecord {
         val ordered = group.sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
-        val bounds = Bounds2D(
+        val lines = mutableListOf<TextLineRecord>()
+        ordered.forEach { region ->
+            region.lines.ifEmpty { listOf(fallbackLine(region)) }.forEach { line ->
+                appendLine(lines, line)
+            }
+        }
+        // Cross-pass duplicates are dropped above; the frame follows the boxes
+        // that survived instead of the union of the original detections, whose
+        // stray edges shifted the block away from its ink.
+        val bounds = unionBounds(lines) ?: Bounds2D(
             left = ordered.minOf { it.bounds.left },
             top = ordered.minOf { it.bounds.top },
             right = ordered.maxOf { it.bounds.right },
             bottom = ordered.maxOf { it.bounds.bottom },
         )
-        val lines = mutableListOf<TextLineRecord>()
-        ordered.forEach { region ->
-            region.lines.ifEmpty { listOf(fallbackLine(region)) }.forEach { line ->
-                val lineBounds = line.bounds
-                val duplicate = lineBounds != null && lines.any { existing ->
-                    val existingBounds = existing.bounds ?: return@any false
-                    val vertical = min(existingBounds.bottom, lineBounds.bottom) -
-                        max(existingBounds.top, lineBounds.top)
-                    val horizontal = min(existingBounds.right, lineBounds.right) -
-                        max(existingBounds.left, lineBounds.left)
-                    vertical > min(existingBounds.height, lineBounds.height) * ABSORB_LINE_OVERLAP &&
-                        horizontal > min(existingBounds.width, lineBounds.width) * ABSORB_LINE_OVERLAP
-                }
-                if (!duplicate) lines += line
-            }
-        }
         val combinedText = combineText(ordered)
         var weightedConfidence = 0f
         var weight = 0
@@ -374,7 +453,10 @@ internal object OcrParagraphMerger {
     private const val MIN_LINE_HEIGHT = 3f
     private const val MAX_HEIGHT_RATIO = 1.4f
     private const val MAX_OVERLAP_RATIO = 0.45f
-    private const val MAX_GAP_RATIO = 0.6f
+    // Posters with airy leading put 0.6-0.75 line heights between body lines;
+    // the old 0.6 cap split such a paragraph into three separately translated
+    // blocks. Paragraph breaks are separated by much more than one line.
+    private const val MAX_GAP_RATIO = 0.75f
     private const val SENTENCE_BREAK_GAP_RATIO = 0.2f
     private const val LEFT_ALIGNMENT_RATIO = 0.85f
     private const val CENTER_ALIGNMENT_SPREAD = 0.25f
@@ -389,7 +471,15 @@ internal object OcrParagraphMerger {
     private const val SHALLOW_FRAGMENT_OVERLAP = 0.15f
     private const val FRAGMENT_TEXT_SIMILARITY = 0.5f
     private const val ABSORB_GAP_RATIO = 0.35f
-    private const val ABSORB_LINE_OVERLAP = 0.5f
+    private const val DUPLICATE_LINE_OVERLAP = 0.5f
+    private const val DUPLICATE_LINE_SIMILARITY = 0.6f
+    private const val DUPLICATE_LINE_COORD_SLACK = 0.2f
+    private const val SLIVER_MAX_HEIGHT_RATIO = 0.5f
+    private const val SLIVER_MAX_GAP_RATIO = 0.35f
+    private const val SLIVER_IGNORE_HEIGHT_RATIO = 0.18f
+
+    /** Beyond this many rows a box is a text line, however short against a paragraph. */
+    private const val SLIVER_IGNORE_MAX_HEIGHT = 8f
     private const val MIN_BOUNDARY_LETTERS = 8
     private const val MIN_BOUNDARY_LENGTH_RATIO = 0.6f
     private const val BOUNDARY_LINE_SIMILARITY = 0.85f

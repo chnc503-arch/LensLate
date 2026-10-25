@@ -36,6 +36,7 @@ internal object FontMatcher {
         underlined: Boolean,
         struckThrough: Boolean,
         italicHint: Boolean = false,
+        monoHint: Boolean? = null,
     ): FontMatch? {
         val normalized = text.replace('\n', ' ').trim()
         if (normalized.count { it.isLetter() } < 2 || normalized.length > MAX_TEXT_LENGTH) return null
@@ -52,6 +53,8 @@ internal object FontMatcher {
         val sourceGrid = rasterize(mask, maskWidth, sourceBox)
 
         var best: FontMatch? = null
+        val bestSansBySlant = HashMap<Boolean, FontMatch>()
+        val debug = StringBuilder()
         FontCatalog.matchable.forEach { variant ->
             // Ink-mask IoU rewards extra coverage, so a bold face can win on a
             // regular source purely because anti-aliasing thickened the mask.
@@ -59,14 +62,31 @@ internal object FontMatcher {
             if (weightHint <= MAX_REGULAR_HINT && variant.weight >= BOLD_VARIANT_WEIGHT) {
                 return@forEach
             }
+            // Glyph advances measured on the source decide whether a
+            // monospaced face may compete at all; without this the uniform
+            // silhouette of a dense mono bold stole geometric sans headings.
+            if (monoHint == false && variant.fontClass == "monospace") {
+                return@forEach
+            }
             // An upright face cannot imitate a real lean and vice versa, so the
             // shape comparison decides; the hint only nudges close calls. The
             // old hard filter missed italics whose slant estimate came out low
-            // and forced an upright face onto slanted source text.
+            // and forced an upright face onto slanted source text. A slanted
+            // silhouette also happens to overlap an upright mask well, so an
+            // unmeasured lean has to cost more than that accidental gain.
             val slantPenalty = when {
                 variant.italic && !italicHint -> ITALIC_WITHOUT_HINT_PENALTY
                 !variant.italic && italicHint -> UPRIGHT_WITH_ITALIC_HINT_PENALTY
                 else -> 0f
+            }
+            // A short display line carries too few glyph boxes to measure
+            // advances, and the uniform silhouette of a dense mono face then
+            // steals geometric sans headings. Without positive mono evidence
+            // the proportional candidates deserve the benefit of the doubt.
+            val monoPenalty = if (variant.fontClass == "monospace" && monoHint == null) {
+                MONO_WITHOUT_EVIDENCE_PENALTY
+            } else {
+                0f
             }
             val typeface = FontCatalog.typeface(variant.key) ?: return@forEach
             val candidate = renderCandidate(
@@ -88,15 +108,58 @@ internal object FontMatcher {
             val widthRatio = sourceBox.width().toFloat() / max(1, candidate.bounds.width())
             val widthDeviation = abs(ln(widthRatio.coerceAtLeast(0.2f))) / LN_MAX_WIDTH_DEVIATION
             val widthBonus = WIDTH_BONUS * (1f - widthDeviation.coerceIn(0f, 1f))
-            val score = (shapeScore + weightBonus + widthBonus - slantPenalty).coerceIn(0f, 1f)
+            val score = (shapeScore + weightBonus + widthBonus - slantPenalty - monoPenalty)
+                .coerceIn(0f, 1f)
+            if (DEBUG_SCORES) {
+                debug.append(variant.key)
+                    .append('=').append("%.3f".format(score))
+                    .append("(s").append("%.2f".format(shapeScore))
+                    .append(",w").append("%.2f".format(weightBonus))
+                    .append(",x").append("%.2f".format(widthBonus))
+                    .append(",r").append("%.2f".format(widthRatio))
+                    .append(") ")
+            }
+            val horizontalScale = (sourceBox.width().toFloat() / max(1, candidate.bounds.width()))
+                .coerceIn(MIN_HORIZONTAL_SCALE, MAX_HORIZONTAL_SCALE)
             if (best == null || score > best!!.score) {
                 best = FontMatch(
                     variant = variant,
                     score = score,
-                    horizontalScale = (sourceBox.width().toFloat() / max(1, candidate.bounds.width()))
-                        .coerceIn(MIN_HORIZONTAL_SCALE, MAX_HORIZONTAL_SCALE),
+                    horizontalScale = horizontalScale,
                 )
             }
+            if (variant.fontClass == "sans") {
+                val rival = bestSansBySlant[variant.italic]
+                if (rival == null || score > rival.score) {
+                    bestSansBySlant[variant.italic] = FontMatch(
+                        variant = variant,
+                        score = score,
+                        horizontalScale = horizontalScale,
+                    )
+                }
+            }
+        }
+        // Blur can put a serif silhouette within a few hundredths of the real
+        // sans on the same ink. When the scores are that close, the family the
+        // page actually uses is stronger evidence than mask jitter, so a sans of
+        // the same lean and an equal or closer weight takes the tie. Only a
+        // same-slant rival counts: handing an italic winner an upright sans
+        // would trade one wrong axis for another.
+        val serifBest = best
+        val sansRival = serifBest?.let { bestSansBySlant[it.variant.italic] }
+        if (serifBest != null && sansRival != null &&
+            serifBest.variant.fontClass == "serif" &&
+            serifBest.score - sansRival.score <= FAMILY_TIE_MARGIN &&
+            abs(sansRival.variant.weight - weightHint) <= abs(serifBest.variant.weight - weightHint)
+        ) {
+            best = sansRival
+        }
+        if (DEBUG_SCORES) {
+            android.util.Log.d(
+                "LensLateFont",
+                "«${normalized.take(24)}» hint=${weightHint} mono=$monoHint " +
+                    "best=${best?.variant?.key}:${"%.3f".format(best?.score ?: 0f)} $debug",
+            )
         }
         return best?.takeIf { it.score >= MIN_MATCH_SCORE }
     }
@@ -222,8 +285,12 @@ internal object FontMatcher {
     private const val MAX_RENDER_WIDTH = 4096
     private const val MAX_RENDER_HEIGHT = 1024
     private const val MAX_TEXT_LENGTH = 180
-    private const val GRID_WIDTH = 64
-    private const val GRID_HEIGHT = 32
+    // Both shapes are stretched to this same aspect, so the grid only fixes the
+    // resolution of the comparison. A 336x36 line at 64 columns put every cell
+    // at 5,2 px wide - wider than the serif feet and hairlines the family
+    // decision rests on - so the detail was destroyed before it was scored.
+    private const val GRID_WIDTH = 128
+    private const val GRID_HEIGHT = 64
     private const val SAMPLES = 3
     private const val MIN_MATCH_SCORE = 0.16f
     private const val MIN_HORIZONTAL_SCALE = 0.45f
@@ -232,8 +299,15 @@ internal object FontMatcher {
     private const val WIDTH_BONUS = 0.02f
     private const val MAX_WIDTH_DEVIATION_RATIO = 1.35f
     private val LN_MAX_WIDTH_DEVIATION = ln(MAX_WIDTH_DEVIATION_RATIO)
-    private const val ITALIC_WITHOUT_HINT_PENALTY = 0.025f
-    private const val UPRIGHT_WITH_ITALIC_HINT_PENALTY = 0.02f
+    private const val FAMILY_TIE_MARGIN = 0.02f
+    private const val ITALIC_WITHOUT_HINT_PENALTY = 0.06f
+    // The lean in italicHint is measured on the ink itself, so an upright face
+    // has to answer for contradicting it. At 0,02 a serif silhouette won «вход
+    // строго по спискам» - a true ARIAL_ITALIC line - by 0,015 of shape noise,
+    // because stretching a slanted line to a fixed grid hides the lean.
+    private const val UPRIGHT_WITH_ITALIC_HINT_PENALTY = 0.06f
+    private const val MONO_WITHOUT_EVIDENCE_PENALTY = 0.06f
     private const val MAX_REGULAR_HINT = 500
     private const val BOLD_VARIANT_WEIGHT = 700
+    private const val DEBUG_SCORES = false
 }

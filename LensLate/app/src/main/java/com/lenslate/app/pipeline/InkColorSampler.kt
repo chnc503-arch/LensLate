@@ -243,6 +243,40 @@ internal object InkColorSampler {
     }
 
     /**
+     * Replace the letters that were sampled as nothing with the line's own ink.
+     * A glyph box which lost its strokes still answers with the anti-aliased
+     * fringe around it, and painted, that colour is an invisible letter inside a
+     * readable word. The neighbours say what this line's ink is worth against
+     * their local paper, so a sample that keeps only a share of the distance the
+     * rest of the line keeps was never ink.
+     *
+     * The bar is relative on purpose: a white-on-white poster is faint for every
+     * letter at once, and there is no outlier to correct.
+     */
+    fun reconcileWeakSamples(
+        samples: List<Int>,
+        backdrops: List<Int>,
+        fallback: Int,
+    ): List<Int> {
+        if (samples.size < MIN_RECONCILED_SAMPLES || samples.size != backdrops.size) return samples
+        val distances = samples.mapIndexed { index, color -> distanceSq(color, backdrops[index]) }
+        val floor = medianValue(distances) * MIN_LINE_INK_SHARE
+        val strong = samples.filterIndexed { index, _ -> distances[index] >= floor }
+        if (strong.isEmpty() || strong.size == samples.size) return samples
+        // A line that is mostly failed samples has nothing to learn from itself;
+        // the ink measured over the whole block is the better answer.
+        val shared = if (strong.size * 2 >= samples.size) medianColor(strong) else fallback
+        return samples.mapIndexed { index, color ->
+            if (distances[index] >= floor) color else shared
+        }
+    }
+
+    private fun medianValue(values: List<Float>): Float {
+        if (values.isEmpty()) return 0f
+        return values.sorted()[values.size / 2]
+    }
+
+    /**
      * [inkLight] restricts sampling to pixels on the same side of the local
      * backdrop as the region ink. Without it a white glyph's dark drop shadow
      * is the strongest signal inside the glyph box and is sampled instead.
@@ -396,6 +430,10 @@ internal object InkColorSampler {
     // Extreme overexposure leaves barely ten grey levels between ink and
     // paper; the old 0.0025 floor discarded exactly those glyphs.
     private const val MIN_PEAK_CHARACTER_DISTANCE_SQ = 0.0005f
+
+    /** A line sample must keep this share of what the rest of the line keeps. */
+    private const val MIN_LINE_INK_SHARE = 0.35f
+    private const val MIN_RECONCILED_SAMPLES = 3
     private const val CHARACTER_STRONG_RATIO = 0.62f
     private const val PEAK_SHARE = 0.25f
     private const val MIN_STRIP_PIXELS = 8

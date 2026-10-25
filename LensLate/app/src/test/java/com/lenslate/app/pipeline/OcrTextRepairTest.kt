@@ -34,6 +34,20 @@ class OcrTextRepairTest {
     }
 
     @Test
+    fun readsTrailingCyrillicErAfterADigitAsRubleSign() {
+        // Tesseract has no ruble glyph in its Russian data, so "2 400 ₽" comes
+        // back as "2 400 Р" and the translator answers with the letter R.
+        assertEquals("ЦЕНА 2 400 ₽", OcrTextRepair.repair("ЦЕНА 2 400 Р"))
+        assertEquals("1500₽.", OcrTextRepair.repair("1500р."))
+    }
+
+    @Test
+    fun keepsRInsideWordsAndSeriesCodes() {
+        assertEquals("ЦЕНА 2 400 РУБ", OcrTextRepair.repair("ЦЕНА 2 400 РУБ"))
+        assertEquals("номер 12 Р 34", OcrTextRepair.repair("номер 12 Р 34"))
+    }
+
+    @Test
     fun restoresDecorativeSeparatorFromSpacedApostrophe() {
         assertEquals(
             "акустика · свет · тишина",
@@ -53,7 +67,7 @@ class OcrTextRepairTest {
     @Test
     fun trimsOcrNoiseAroundDisplayLines() {
         assertEquals("ЧЕМНОТЩ", OcrTextRepair.repair("___./ЧЕМНОТЩ"))
-        assertEquals("ОДИН ВЕЧЕР ОДНА СЦЕН", OcrTextRepair.repair("ОДИН ВЕЧЕР ОДНА СЦЕН ^"))
+        assertEquals("ОДИН ВЕЧЕР ОДНА СЦЕНА", OcrTextRepair.repair("ОДИН ВЕЧЕР ОДНА СЦЕН ^"))
     }
 
     @Test
@@ -76,5 +90,12 @@ class OcrTextRepairTest {
             "нескольких УРОВНЯХ ЯРКОСТИ. Проверка идёт по всей строке:",
             OcrTextRepair.repair("нескольких  УРОВНЯХ  ЯРКОСТИ ./Проверка идёт по всей строке:"),
         )
+    }
+
+    @Test
+    fun restoresFadedLastGlyphOfDisplayHeading() {
+        assertEquals("ОДНА СЦЕНА", OcrTextRepair.repair("ОДНА СЦЕН ^"))
+        assertEquals("ТИХИЙ БАР · СТОЙКА 3", OcrTextRepair.repair("ТИХИЙ БАР - СТОЙКА 3 ^"))
+        assertEquals("тихий бар свет", OcrTextRepair.repair("тихий бар свет ^"))
     }
 }

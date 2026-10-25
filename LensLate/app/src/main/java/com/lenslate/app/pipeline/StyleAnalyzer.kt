@@ -91,7 +91,12 @@ class StyleAnalyzer @Inject constructor() {
         val lineBoxes = region.lines.mapNotNull { line ->
             line.bounds?.toRect()?.let { clampRect(it, bitmap) }?.takeIf { !it.isEmpty }
         }
-        val capHeight = estimateCapHeight(region, lineBoxes, height)
+        val measuredCap = estimateCapHeight(region, lineBoxes, height)
+        // A symbol box may be taller than the printed capitals (a merged box
+        // around a diacritic, or an antialiased halo); the type size derived
+        // from it then renders the translation oversized. The rows the line
+        // actually inks set the ceiling.
+        val capHeight = clampCapToInk(mask, width, height, region, rect, measuredCap)
         // A halo on the opposite side of the paper is the source drop shadow
         // or glow. Its blur scales with the type size, and the centroid shift
         // between halo and strokes approximates the shadow offset.
@@ -110,28 +115,51 @@ class StyleAnalyzer @Inject constructor() {
             ?: 0f
         val sizePx = (capHeight / CAP_HEIGHT_RATIO).coerceIn(MIN_FONT_SIZE, MAX_FONT_SIZE)
         val strokeWidth = estimateStrokeWidth(mask, width, height, capHeight)
-        val density = estimateInkDensity(mask, width, height, lineBoxes)
+        // The mask lives in region-local coordinates; raw line boxes are in
+        // bitmap coordinates and must be shifted or the whole density signal
+        // reads an empty area.
+        val localLineBoxes = lineBoxes.map { box ->
+            Rect(
+                box.left - rect.left,
+                box.top - rect.top,
+                box.right - rect.left,
+                box.bottom - rect.top,
+            )
+        }
+        val density = estimateInkDensity(mask, width, height, localLineBoxes)
         val weight = estimateWeight(strokeWidth, capHeight, density)
-        val mono = FontShapeEstimator.isMonospaced(
-            region.lines.map { line ->
-                line.elements
-                    .flatMap { element -> element.symbols }
-                    .mapNotNull { symbol ->
-                        symbol.bounds?.let { bounds ->
-                            GlyphBox(symbol.text, bounds.left, bounds.right)
-                        }
+        val symbolLines = region.lines.map { line ->
+            line.elements
+                .flatMap { element -> element.symbols }
+                .mapNotNull { symbol ->
+                    symbol.bounds?.let { bounds ->
+                        GlyphBox(symbol.text, bounds.left, bounds.right)
                     }
-            },
-        )
+                }
+        }
+        val mono = FontShapeEstimator.isMonospaced(symbolLines)
+        // Without glyph boxes the uniformity test has no evidence; only a
+        // measured proportional result may veto the monospaced variants.
+        val monoHint = if (symbolLines.sumOf { it.size } >= MIN_MONO_HINT_SYMBOLS) mono else null
         val alignment = estimateAlignment(region)
+        // FontShapeEstimator reads the mask, which is region-local; passing the
+        // bitmap-space boxes clamped every span into the last few rows and the
+        // slant always came back as zero.
+        val lineSpans = localLineBoxes.map { TextLineSpan(it.left, it.top, it.right, it.bottom) }
         val slant = FontShapeEstimator.slantDegrees(
             mask = mask,
             width = width,
             height = height,
-            lines = lineBoxes.map { TextLineSpan(it.left, it.top, it.right, it.bottom) },
+            lines = lineSpans,
         )
-        val letterSpacing = estimateLetterSpacing(region, sizePx, mono)
-        val lineSpacing = estimateLineSpacing(region, sizePx)
+        // OCR glyph boxes cover the whole advance cell, so on faint caps they
+        // swallow the letter spacing and report a tight line. The mask sees the
+        // ink itself and can only under-report, never invent gaps: take the
+        // wider of the two readings.
+        val symbolSpacing = estimateLetterSpacing(region, sizePx, mono)
+        val maskSpacing = estimateMaskLetterSpacing(mask, width, height, lineSpans, sizePx, mono)
+        val letterSpacing = max(symbolSpacing ?: 0f, maskSpacing ?: 0f)
+        val lineSpacing = estimateLineSpacing(region, sizePx, mask, width, height)
         val underlined = detectDecoration(mask, width, height, lineBoxes, region, underline = true)
         val struckThrough = detectDecoration(mask, width, height, lineBoxes, region, underline = false)
         val characterStyles = analyzeCharacterStyles(
@@ -155,6 +183,7 @@ class StyleAnalyzer @Inject constructor() {
             underlined = underlined,
             struckThrough = struckThrough,
             italicHint = slant >= MIN_ITALIC_SLANT,
+            monoHint = monoHint,
         )
         val variant = fontMatch?.variant
         val fontFamily = variant?.fontClass ?: if (mono) "monospace" else "sans"
@@ -165,6 +194,7 @@ class StyleAnalyzer @Inject constructor() {
         android.util.Log.d(
             "LensLateStyle",
             "«${region.text.replace('\n', ' ').take(24)}» cap=${"%.1f".format(capHeight)} " +
+                "capRaw=${"%.1f".format(measuredCap)} size=${"%.1f".format(sizePx)} " +
                 "stroke=${"%.2f".format(strokeWidth)} w=$weight sl=${"%.1f".format(slant)} " +
                 "font=$fontKey score=${"%.2f".format(fontMatch?.score ?: 0f)} " +
                 "mix=${"%.2f".format(letterSpacing)} line=${"%.2f".format(lineSpacing)} " +
@@ -249,20 +279,22 @@ class StyleAnalyzer @Inject constructor() {
             // A trend measured across a whole paragraph would read line breaks
             // as a size drift; every line is normalised on its own.
             val scales = sizeTrend(units)
-            units.mapIndexed { index, unit ->
-                TextStyleSample(
-                    color = sampleUnitColor(
-                        bitmap,
-                        unit.bounds,
-                        background,
-                        fallbackColor,
-                        inkLight,
-                    ),
-                    scale = scales[index],
-                )
+            val sampled = units.map { unit ->
+                sampleUnitColor(bitmap, unit.bounds, background, fallbackColor, inkLight)
+            }
+            val colors = InkColorSampler.reconcileWeakSamples(
+                samples = sampled.map(UnitSample::color),
+                backdrops = sampled.map(UnitSample::backdrop),
+                fallback = fallbackColor,
+            )
+            units.mapIndexed { index, _ ->
+                TextStyleSample(color = colors[index], scale = scales[index])
             }
         }
     }
+
+    /** The colour read for one glyph and the paper it was judged against. */
+    private data class UnitSample(val color: Int, val backdrop: Int)
 
     private fun collectInkUnits(line: TextLineRecord): List<InkUnit> {
         val symbols = line.elements
@@ -287,9 +319,9 @@ class StyleAnalyzer @Inject constructor() {
         background: Int,
         fallbackColor: Int,
         inkLight: Boolean?,
-    ): Int {
+    ): UnitSample {
         val bounds = clampRect(unitBounds.toRect(), bitmap)
-        if (bounds.width() < 2 || bounds.height() < 2) return fallbackColor
+        if (bounds.width() < 2 || bounds.height() < 2) return UnitSample(fallbackColor, background)
         // A narrow strip above and below the glyph measures the backdrop where
         // that glyph actually sits. On a gradient or textured poster the
         // paragraph-wide median is wrong for most of the line, and the glyph's
@@ -301,7 +333,7 @@ class StyleAnalyzer @Inject constructor() {
         val bottomPad = min(pad, bitmap.height - bounds.bottom)
         val sampleWidth = bounds.width()
         val sampleHeight = bounds.height() + topPad + bottomPad
-        if (sampleWidth < 2 || sampleHeight <= 0) return fallbackColor
+        if (sampleWidth < 2 || sampleHeight <= 0) return UnitSample(fallbackColor, background)
         val pixels = IntArray(sampleWidth * sampleHeight)
         try {
             bitmap.getPixels(
@@ -314,7 +346,7 @@ class StyleAnalyzer @Inject constructor() {
                 sampleHeight,
             )
         } catch (_: IllegalArgumentException) {
-            return fallbackColor
+            return UnitSample(fallbackColor, background)
         }
         val backdrop = InkColorSampler.estimateBackdrop(
             topStrip = rows(pixels, sampleWidth, 0, topPad),
@@ -322,15 +354,18 @@ class StyleAnalyzer @Inject constructor() {
             globalBackground = background,
             inkColor = fallbackColor,
         )
-        return InkColorSampler.sampleGlyphColor(
-            pixels = pixels,
-            width = sampleWidth,
-            glyphTop = topPad,
-            glyphBottom = topPad + bounds.height(),
-            backdrop = backdrop,
-            fallbackInk = fallbackColor,
-            mode = InkColorSampler.Mode.ADAPTIVE,
-            inkLight = inkLight,
+        return UnitSample(
+            color = InkColorSampler.sampleGlyphColor(
+                pixels = pixels,
+                width = sampleWidth,
+                glyphTop = topPad,
+                glyphBottom = topPad + bounds.height(),
+                backdrop = backdrop,
+                fallbackInk = fallbackColor,
+                mode = InkColorSampler.Mode.ADAPTIVE,
+                inkLight = inkLight,
+            ),
+            backdrop = backdrop.colorAt(0.5f),
         )
     }
 
@@ -424,6 +459,7 @@ class StyleAnalyzer @Inject constructor() {
         underlined: Boolean,
         struckThrough: Boolean,
         italicHint: Boolean,
+        monoHint: Boolean?,
     ): FontMatch? {
         if (region.isVertical || region.isCurved) return null
         if (capHeight < MIN_FONT_MATCH_CAP_HEIGHT || maskWidth < 8 || maskHeight < 6) return null
@@ -459,6 +495,7 @@ class StyleAnalyzer @Inject constructor() {
                     underlined = underlined,
                     struckThrough = struckThrough,
                     italicHint = italicHint,
+                    monoHint = monoHint,
                 )
             }.getOrNull() ?: return@forEach
             if (best == null || match.score > best!!.score) best = match
@@ -607,9 +644,89 @@ class StyleAnalyzer @Inject constructor() {
                 else -> xHeight += height
             }
         }
-        median(caps)?.let { return it }
-        median(ascenders)?.let { return it * ASCENDER_HEIGHT_RATIO }
-        return median(xHeight)?.times(X_HEIGHT_TO_CAP_RATIO)
+        val cap = median(caps)
+        val ascenderCap = median(ascenders)?.times(ASCENDER_HEIGHT_RATIO)
+        val xCap = median(xHeight)?.times(X_HEIGHT_TO_CAP_RATIO)
+        android.util.Log.d(
+            "LensLateCap",
+            "n=${symbols.size} cap=$cap asc=$ascenderCap x=$xCap " +
+                "sample=${symbols.take(10).joinToString { "${it.first}:${"%.1f".format(it.second)}" }}",
+        )
+        if (cap != null) {
+            // A line with one real capital and several lowercase glyphs
+            // misread as capitals drags the cap median down to the x-height.
+            // Caps never sit below x-height in the same font, so the x-height
+            // evidence corrects the reading instead of shrinking the type.
+            if (xCap != null && cap < xCap * MIN_CAP_TO_X_RATIO) return xCap
+            return cap
+        }
+        if (ascenderCap != null) return ascenderCap
+        return xCap
+    }
+
+    private fun clampCapToInk(
+        mask: BooleanArray,
+        width: Int,
+        height: Int,
+        region: TextRegionRecord,
+        rect: Rect,
+        capHeight: Float,
+    ): Float {
+        val spans = ArrayList<Float>()
+        region.lines.forEach { line ->
+            val box = line.bounds ?: return@forEach
+            // Only a line printed entirely in capitals or digits fills its
+            // rows with cap-height ink. In mixed-case body text most rows show
+            // x-height letters, so the run would measure the x-height and
+            // shrink a correctly measured paragraph; the symbol boxes already
+            // carry the real capital height there.
+            val visible = line.text.filter(Char::isLetterOrDigit)
+            if (visible.isEmpty() || visible.any(Char::isLowerCase)) return@forEach
+            val top = (kotlin.math.floor(box.top).toInt() - rect.top).coerceIn(0, height - 1)
+            val bottom = (kotlin.math.ceil(box.bottom).toInt() - rect.top).coerceIn(top + 1, height)
+            val rows = bottom - top
+            val counts = IntArray(rows)
+            var peak = 0
+            for (y in top until bottom) {
+                var count = 0
+                val offset = y * width
+                for (x in 0 until width) {
+                    if (mask[offset + x]) count++
+                }
+                counts[y - top] = count
+                if (count > peak) peak = count
+            }
+            if (peak < MIN_INK_ROW_PIXELS) return@forEach
+            val floor = max(MIN_INK_ROW_PIXELS, (peak * INK_ROW_PEAK_RATIO).roundToInt())
+            var runStart = -1
+            var lastInked = -1
+            var bestStart = -1
+            var bestEnd = -1
+            var bestMass = -1
+            for (index in 0..rows) {
+                val inked = index < rows && counts[index] >= floor
+                if (inked) {
+                    if (runStart < 0) runStart = index
+                    lastInked = index
+                } else if (runStart >= 0 && (index >= rows || index - lastInked > MAX_INK_ROW_GAP)) {
+                    var mass = 0
+                    for (row in runStart..lastInked) mass += counts[row]
+                    if (mass > bestMass) {
+                        bestMass = mass
+                        bestStart = runStart
+                        bestEnd = lastInked
+                    }
+                    runStart = -1
+                }
+            }
+            if (bestStart < 0) return@forEach
+            spans += (bestEnd - bestStart + 1).toFloat()
+        }
+        val span = median(spans) ?: return capHeight
+        // A broken mask can show a few rows of an otherwise faint line; the
+        // floor keeps that from shrinking a well-measured region.
+        if (span >= capHeight || span < capHeight * MIN_INK_CLAMP_RATIO) return capHeight
+        return span
     }
 
     private fun median(values: List<Float>): Float? {
@@ -725,7 +842,7 @@ class StyleAnalyzer @Inject constructor() {
         region: TextRegionRecord,
         sizePx: Float,
         mono: Boolean,
-    ): Float {
+    ): Float? {
         val gaps = ArrayList<Float>()
         region.lines.forEach { line ->
             val symbols = line.elements
@@ -739,25 +856,95 @@ class StyleAnalyzer @Inject constructor() {
                 if (gap in (-sizePx * 0.4f)..(sizePx * 1.4f)) gaps += gap
             }
         }
-        if (gaps.size < MIN_SPACING_SAMPLES) return 0f
+        if (gaps.size < MIN_SPACING_SAMPLES) return null
         gaps.sort()
         val median = gaps[gaps.size / 2]
-        val naturalGap = sizePx * if (mono) MONO_NATURAL_GAP_RATIO else SANS_NATURAL_GAP_RATIO
-        return (median - naturalGap).coerceIn(0f, sizePx * MAX_EXTRA_TRACKING_RATIO)
+        return extraTracking(median, sizePx, mono)
     }
 
-    private fun estimateLineSpacing(region: TextRegionRecord, sizePx: Float): Float {
-        val centers = region.lines
-            .mapNotNull { it.bounds }
-            .sortedBy { it.top }
-            .map { (it.top + it.bottom) / 2f }
-        if (centers.size < 2) return DEFAULT_LINE_SPACING
-        val pitches = centers.zipWithNext { first, second -> abs(second - first) }
-            .filter { it > 1f }
-            .sorted()
-        if (pitches.isEmpty()) return DEFAULT_LINE_SPACING
-        val pitch = pitches[pitches.size / 2]
+    /**
+     * Faint display caps often lose most of their glyph boxes, which throws
+     * away the tracking the whole headline is built on. The region's own ink
+     * mask still shows the whitespace between letterforms, so measure it there
+     * when OCR evidence runs out.
+     */
+    private fun estimateMaskLetterSpacing(
+        mask: BooleanArray,
+        width: Int,
+        height: Int,
+        lineSpans: List<TextLineSpan>,
+        sizePx: Float,
+        mono: Boolean,
+    ): Float? {
+        val medianGap = FontShapeEstimator.stemGapPx(mask, width, height, lineSpans, sizePx)
+            ?: return null
+        return extraTracking(medianGap, sizePx, mono)
+    }
+
+    private fun extraTracking(medianGap: Float, sizePx: Float, mono: Boolean): Float {
+        val naturalGap = sizePx * if (mono) MONO_NATURAL_GAP_RATIO else SANS_NATURAL_GAP_RATIO
+        return (medianGap - naturalGap).coerceIn(0f, sizePx * MAX_EXTRA_TRACKING_RATIO)
+    }
+
+    private fun estimateLineSpacing(
+        region: TextRegionRecord,
+        sizePx: Float,
+        mask: BooleanArray,
+        width: Int,
+        height: Int,
+    ): Float {
+        // OCR line boxes drift by several pixels from pass to pass, which
+        // inflated the pitch of a two-line paragraph by a quarter. The ink
+        // mask row profile measures the real baselines of this very region.
+        val pitch = pitchFromMask(mask, width, height, sizePx) ?: run {
+            val centers = region.lines
+                .mapNotNull { it.bounds }
+                .sortedBy { it.top }
+                .map { (it.top + it.bottom) / 2f }
+            if (centers.size < 2) return DEFAULT_LINE_SPACING
+            val pitches = centers.zipWithNext { first, second -> abs(second - first) }
+                .filter { it > 1f }
+                .sorted()
+            if (pitches.isEmpty()) return DEFAULT_LINE_SPACING
+            pitches[pitches.size / 2]
+        }
         return (pitch / (sizePx * NOMINAL_LINE_HEIGHT_RATIO)).coerceIn(MIN_LINE_SPACING, MAX_LINE_SPACING)
+    }
+
+    private fun pitchFromMask(
+        mask: BooleanArray,
+        width: Int,
+        height: Int,
+        sizePx: Float,
+    ): Float? {
+        if (width < 4 || height < 8) return null
+        val counts = IntArray(height)
+        for (y in 0 until height) {
+            var ink = 0
+            val row = y * width
+            for (x in 0 until width) if (mask[row + x]) ink++
+            counts[y] = ink
+        }
+        val peak = counts.maxOrNull() ?: return null
+        if (peak < 6) return null
+        val floor = max(2, (peak * MASK_LINE_BAND_SHARE).roundToInt())
+        val centers = mutableListOf<Float>()
+        var start = -1
+        for (y in 0..height) {
+            val inked = y < height && counts[y] >= floor
+            if (inked && start < 0) {
+                start = y
+            } else if (!inked && start >= 0) {
+                if (y - start >= MIN_MASK_LINE_BAND) centers += (start + y - 1) / 2f
+                start = -1
+            }
+        }
+        if (centers.size < 2) return null
+        val pitches = centers.zipWithNext { first, second -> second - first }
+            .filter { it >= sizePx * MIN_MASK_PITCH_RATIO && it <= sizePx * MAX_MASK_PITCH_RATIO }
+            .sorted()
+        if (pitches.isEmpty()) return null
+        return pitches[pitches.size / 2]
     }
 
     private fun detectDecoration(
@@ -923,7 +1110,19 @@ class StyleAnalyzer @Inject constructor() {
         const val MIN_LOCAL_STRIP_PAD = 2
         const val MAX_LOCAL_STRIP_PAD = 10
         const val MIN_FONT_MATCH_CAP_HEIGHT = 4f
+        const val MIN_CAP_TO_X_RATIO = 0.92f
+        const val INK_ROW_PEAK_RATIO = 0.15f
+        const val MIN_INK_ROW_PIXELS = 2
+        const val MAX_INK_ROW_GAP = 1
+        const val MIN_INK_CLAMP_RATIO = 0.3f
+        const val MASK_LINE_BAND_SHARE = 0.06f
+        const val MIN_MASK_LINE_BAND = 2
+        const val MIN_MASK_PITCH_RATIO = 0.7f
+        const val MAX_MASK_PITCH_RATIO = 2.2f
         const val MIN_FONT_MATCH_LETTERS = 2
+        // Below this many recognised glyphs the advance-uniformity test cannot
+        // tell a monospaced face from a short all-caps word.
+        const val MIN_MONO_HINT_SYMBOLS = 8
         const val REPRESENTATIVE_LETTERS = 26
         const val REPRESENTATIVE_ATTEMPTS = 2
         const val MAX_COLOR_SAMPLES = 90_000

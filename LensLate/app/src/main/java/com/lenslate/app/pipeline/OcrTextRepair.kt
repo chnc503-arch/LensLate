@@ -23,13 +23,21 @@ internal object OcrTextRepair {
 
     private fun repairLine(line: String): String {
         if (line.isBlank()) return ""
-        var trimmed = TRAILING_NOISE.replace(LEADING_NOISE.replace(line, ""), "")
+        // The last glyph of a faded display heading survives as a caret, and in
+        // caps the only letter that resembles one is А. Restoring it before the
+        // noise trim keeps the word whole instead of truncating it.
+        val braced = if (isDisplayCaps(line)) CAPS_TRAILING_CARET.replace(line, "А") else line
+        var trimmed = TRAILING_NOISE.replace(LEADING_NOISE.replace(braced, ""), "")
         // Sparse segmentation sometimes glues a slash and a period to the end of
         // a sentence ("ЯРКОСТИ ./Проверка"), which then breaks the translation.
         trimmed = SENTENCE_SLASH.replace(trimmed) { match ->
             "${match.groupValues[1]} "
         }
         trimmed = trimmed.replace(SPACED_COLON_INSIDE, ":")
+        // The Russian Tesseract data has no ruble glyph, so a price ends with
+        // the letter that shares its shape. Only a trailing one counts: a
+        // region code ("12 Р 34") keeps its letter.
+        trimmed = RUBLE_SIGN.replace(trimmed, "₽")
         if (isDisplayCaps(trimmed)) {
             trimmed = CAPS_SEPARATOR.replace(trimmed, " · ")
         }
@@ -63,7 +71,9 @@ internal object OcrTextRepair {
     private val LEADING_NOISE = Regex("^[\\s_^`~\\\\|<>{}\\[\\]]+[.,;:/\\-–—]*")
     private val TRAILING_NOISE = Regex("[\\s_^`~\\\\|<>{}\\[\\]]+$")
     private val SENTENCE_SLASH = Regex("\\s*([.!?…])\\s*[/\\\\]+\\s*(?=[А-ЯЁA-Z])")
+    private val CAPS_TRAILING_CARET = Regex("(?<=\\p{L})\\s+\\^\\s*$")
     private val SPACED_COLON_INSIDE = Regex("(?<=\\d):\\s+(?=\\d{2}(?!\\d))")
+    private val RUBLE_SIGN = Regex("(?<=\\d[ \u00A0]?)[Рр](?=[\\s.,;:!?)]*$)")
     private val CAPS_SEPARATOR = Regex("\\s+[-–]\\s+")
     private val DOUBLE_SPACE = Regex(" {2,}")
     private val TOKEN = Regex("\\S+")

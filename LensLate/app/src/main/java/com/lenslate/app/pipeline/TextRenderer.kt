@@ -175,6 +175,13 @@ class TextRenderer @Inject constructor() {
         val bounds = region.bounds
         val frame = frames.first()
         val baseSize = calibratedSize(style, paint)
+        android.util.Log.i(
+            "LensLateRender",
+            "region=${region.id} frames=${frames.size} lines=${region.lines.size} " +
+                "bounds=${region.bounds} family=${style.fontFamily} weight=${style.fontWeight} " +
+                "bold=${style.isBold} styleSize=${style.sizePx} base=$baseSize " +
+                "text=${text.take(48).replace('\n', '/')}",
+        )
 
         val layout: StaticLayout
         val drawLeft: Float
@@ -191,26 +198,10 @@ class TextRenderer @Inject constructor() {
             var size = baseSize.coerceIn(MIN_TEXT_SIZE, sizeCeiling)
             var naturalWidth = measureUnwrappedWidth(spannable, paint, size, style)
             if (naturalWidth <= 0f) return
-            if (naturalWidth < targetWidth && content.length > 1) {
-                // Short translations gain tracking first: widening the gaps
-                // keeps glyph shapes intact longer than stretching them does.
-                val extraEm = ((targetWidth - naturalWidth) / (content.length - 1)) / size
-                if (extraEm > MIN_TRACKING_INCREMENT) {
-                    paint.letterSpacing = (paint.letterSpacing +
-                        extraEm.coerceAtMost(MAX_EXTRA_TRACKING_EM))
-                        .coerceAtMost(MAX_TOTAL_TRACKING_EM)
-                    naturalWidth = measureUnwrappedWidth(spannable, paint, size, style)
-                }
-            }
-            if (naturalWidth < targetWidth) {
-                val stretch = (targetWidth / naturalWidth.coerceAtLeast(0.01f))
-                    .coerceIn(1f, MAX_WIDTH_STRETCH_SCALE)
-                if (stretch > 1.001f) {
-                    paint.textScaleX = (paint.textScaleX * stretch)
-                        .coerceIn(MIN_HORIZONTAL_SCALE, MAX_HORIZONTAL_SCALE)
-                    naturalWidth = measureUnwrappedWidth(spannable, paint, size, style)
-                }
-            } else if (naturalWidth > targetWidth) {
+            // Never widen a translation: tracking and horizontal scale come from
+            // the source style, and stretching a short word to the source box
+            // turns a tight headline into spaced-out letters.
+            if (naturalWidth > targetWidth) {
                 // A long translation shrinks moderately before the glyphs are
                 // squeezed: a smaller optical size reads as the same typeface,
                 // a compressed one does not.
@@ -265,7 +256,13 @@ class TextRenderer @Inject constructor() {
                 text = spannable,
                 paint = paint,
                 maxWidth = targetWidth,
-                maxHeight = placement.maxHeight,
+                // The window may grow into empty neighbours, but the block itself
+                // must stay on its own lines: unbounded growth stretched a short
+                // translation over the paragraph below it.
+                maxHeight = minOf(
+                    placement.maxHeight,
+                    (bounds.height * MAX_MULTILINE_BOUNDS_GROWTH).roundToInt(),
+                ),
                 style = style,
                 alignment = alignment,
                 startSize = baseSize,
@@ -280,6 +277,9 @@ class TextRenderer @Inject constructor() {
                     sourceLines = frames.size,
                     sourceHeight = bounds.height,
                     window = placement,
+                ).coerceIn(
+                    bounds.top,
+                    (bounds.bottom - layout.height).coerceAtLeast(bounds.top),
                 )
             } else {
                 bounds.top + (bounds.height - layout.height) / 2f +
@@ -287,6 +287,12 @@ class TextRenderer @Inject constructor() {
             }
         }
 
+        android.util.Log.i(
+            "LensLateRender",
+            "region=${region.id} single=$singleSourceLine layoutLines=${layout.lineCount} " +
+                "paintSize=${paint.textSize} scaleX=${paint.textScaleX} " +
+                "track=${paint.letterSpacing} drawTop=$drawTop height=${layout.height}",
+        )
         canvas.save()
         if (abs(style.angle) >= MIN_ROTATION_DEGREES) {
             canvas.rotate(
@@ -1058,6 +1064,7 @@ class TextRenderer @Inject constructor() {
         const val MIN_FIT_SIZE_SCALE = 0.82f
         const val MIN_LINE_COUNT_SIZE_SCALE = 0.86f
         const val MAX_NEIGHBOUR_GROWTH_RATIO = 0.45f
+        const val MAX_MULTILINE_BOUNDS_GROWTH = 1.06f
         const val NEIGHBOUR_GAP_EM = 0.08f
         const val MAX_LINE_SPACING_REDUCTION = 0.35f
         const val MAX_LINE_SPACING_ADDITION = 0.8f

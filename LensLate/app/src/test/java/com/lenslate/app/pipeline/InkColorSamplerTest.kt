@@ -113,6 +113,43 @@ class InkColorSamplerTest {
     }
 
     @Test
+    fun aLetterSampledAtTheFringeTakesTheColourOfItsNeighbours() {
+        // Page 07, dark body copy: every glyph of the line stands ~35 levels
+        // above its paper except two, whose boxes lost their strokes and came
+        // back as anti-aliasing. Painted as sampled, those letters are invisible.
+        val samples = listOf(
+            0xFF2C2E37.toInt(),
+            0xFF2E3039.toInt(),
+            0xFF12131A.toInt(),
+            0xFF2B2D36.toInt(),
+            0xFF2D2F38.toInt(),
+        )
+        val backdrops = List(samples.size) { darkPaper }
+        val fixed = InkColorSampler.reconcileWeakSamples(samples, backdrops, darkBodyInk)
+        assertColorNear(0xFF2C2E37.toInt(), fixed[2], tolerance = 2)
+        assertEquals(samples[0], fixed[0])
+        assertEquals(samples[1], fixed[1])
+        assertEquals(samples[3], fixed[3])
+        assertEquals(samples[4], fixed[4])
+    }
+
+    @Test
+    fun aWholeFaintLineKeepsEverySampleOfItsOwn() {
+        // White-on-white is faint everywhere; there is no stronger neighbour to
+        // appeal to, and replacing the samples would erase the gradient.
+        val samples = listOf(0xFFFCFAF4.toInt(), 0xFFFBF8F1.toInt(), 0xFFFAF7F0.toInt())
+        val backdrops = List(samples.size) { paper }
+        assertEquals(samples, InkColorSampler.reconcileWeakSamples(samples, backdrops, whiteInk))
+    }
+
+    @Test
+    fun tooFewLettersToJudgeLeaveTheLineAlone() {
+        val samples = listOf(0xFF2C2E37.toInt(), 0xFF12131A.toInt())
+        val backdrops = List(samples.size) { darkPaper }
+        assertEquals(samples, InkColorSampler.reconcileWeakSamples(samples, backdrops, darkBodyInk))
+    }
+
+    @Test
     fun peakModeStaysCloserToInkWhenNoPixelIsFullyCovered() {
         // A blurry glyph has a coverage gradient instead of a solid core. The
         // median of the strong pixels lands on the middle coverage, the peak
@@ -454,5 +491,7 @@ class InkColorSamplerTest {
         val paper = 0xFFF7F3E8.toInt()
         val whiteInk = 0xFFFFFCF3.toInt()
         val shadow = 0xFFC7C3BA.toInt()
+        val darkPaper = 0xFF0A0A0E.toInt()
+        val darkBodyInk = 0xFF2C2E37.toInt()
     }
 }

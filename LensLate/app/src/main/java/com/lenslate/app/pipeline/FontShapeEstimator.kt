@@ -3,6 +3,7 @@ package com.lenslate.app.pipeline
 import kotlin.math.abs
 import kotlin.math.atan
 import kotlin.math.ceil
+import kotlin.math.max
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 import kotlin.math.tan
@@ -93,9 +94,13 @@ internal object FontShapeEstimator {
      * angle that makes vertical stems sharpest in the column projection.
      * Row centroids were too eager: a wide top bar or a single descender moved
      * the centroid by several degrees and upright subtitles came out italic.
+     * The line-wide projection has the same weakness in reverse - word gaps and
+     * sparse ink let a shear win without any stem actually leaning - so the
+     * angle only stands if the individual glyph clusters lean the same way.
      *
      * Returns degrees with the renderer's convention: a right-leaning italic is
-     * negative. Zero means "no measurable slant".
+     * positive, because that is what `Paint.textSkewX` slants right. Zero means
+     * "no measurable slant".
      */
     fun slantDegrees(
         mask: BooleanArray,
@@ -169,9 +174,187 @@ internal object FontShapeEstimator {
         }
         if (abs(refined) < MIN_SLANT_DEGREES) return 0f
         if (bestScore < zeroScore * (1f + MIN_SLANT_GAIN)) return 0f
-        // Best shear is positive for a right-leaning face; the renderer uses
-        // negative textSkewX for that same lean.
-        return -refined.coerceIn(-MAX_SLANT_DEGREES.toFloat(), MAX_SLANT_DEGREES.toFloat())
+        // The shear search maximises column concentration, which a sparse line
+        // of upright glyphs can also reach by accident. The lean of the stems
+        // themselves is the evidence that has to agree.
+        val lean = clusterLeanDegrees(mask, width, height, lines) ?: return 0f
+        if (abs(lean) < MIN_SLANT_DEGREES) return 0f
+        if (lean >= 0f == refined >= 0f) {
+            return lean.coerceIn(-abs(refined), abs(refined))
+                .coerceIn(-MAX_SLANT_DEGREES.toFloat(), MAX_SLANT_DEGREES.toFloat())
+        }
+        return 0f
+    }
+
+    /**
+     * Median lean of the separate glyph clusters of these lines, measured
+     * between the ink centroid of the upper and the lower quarter of each
+     * cluster. Positive leans right, like an italic. Null when too few
+     * clusters carry enough ink to say anything.
+     */
+    private fun clusterLeanDegrees(
+        mask: BooleanArray,
+        width: Int,
+        height: Int,
+        lines: List<TextLineSpan>,
+    ): Float? {
+        val leans = ArrayList<Float>()
+        lines.forEach { span ->
+            val left = span.left.coerceIn(0, width - 1)
+            val right = span.right.coerceIn(left + 1, width)
+            val top = span.top.coerceIn(0, height - 1)
+            val bottom = span.bottom.coerceIn(top + 1, height)
+            val lineHeight = bottom - top
+            val columns = IntArray(right - left)
+            for (y in top until bottom) {
+                val row = y * width
+                for (x in left until right) if (mask[row + x]) columns[x - left]++
+            }
+            var index = 0
+            while (index < columns.size) {
+                if (columns[index] == 0) {
+                    index++
+                    continue
+                }
+                var clusterRight = index
+                while (clusterRight + 1 < columns.size && columns[clusterRight + 1] > 0) clusterRight++
+                val clusterWidth = clusterRight - index + 1
+                // A blob wider than the line is two glyphs touching: its two
+                // halves pull the centroid in opposite directions and the
+                // measurement says nothing about the lean.
+                if (clusterWidth >= MIN_LEAN_CLUSTER_WIDTH && clusterWidth <= lineHeight) {
+                    clusterSpanLean(mask, width, left, top, bottom, index, clusterRight)?.let {
+                        leans += it
+                    }
+                }
+                index = clusterRight + 1
+            }
+        }
+        if (leans.size < MIN_LEAN_CLUSTERS) return null
+        return median(leans)
+    }
+
+    private fun clusterSpanLean(
+        mask: BooleanArray,
+        width: Int,
+        originX: Int,
+        top: Int,
+        bottom: Int,
+        clusterLeft: Int,
+        clusterRight: Int,
+    ): Float? {
+        var inkRows = 0
+        for (y in top until bottom) {
+            val row = y * width
+            for (x in clusterLeft..clusterRight) {
+                if (mask[row + originX + x]) {
+                    inkRows++
+                    break
+                }
+            }
+        }
+        if (inkRows < MIN_LEAN_ROWS) return null
+        val band = max(2, (inkRows * LEAN_BAND_SHARE).roundToInt())
+        var headCount = 0
+        var headX = 0
+        var headY = 0
+        var tailCount = 0
+        var tailX = 0
+        var tailY = 0
+        var rank = -1
+        for (y in top until bottom) {
+            val row = y * width
+            var count = 0
+            var sumX = 0
+            for (x in clusterLeft..clusterRight) {
+                if (mask[row + originX + x]) {
+                    count++
+                    sumX += x
+                }
+            }
+            if (count == 0) continue
+            rank++
+            // Bands are counted in rows, not in pixels: a wide row would
+            // otherwise swallow the head and leave the tail holding most of
+            // the glyph, which reads as a lean on any letter with a flat top.
+            if (rank < band) {
+                headCount += count
+                headX += sumX
+                headY += count * y
+            }
+            if (rank >= inkRows - band) {
+                tailCount += count
+                tailX += sumX
+                tailY += count * y
+            }
+        }
+        if (headCount == 0 || tailCount == 0) return null
+        val headMeanX = headX.toFloat() / headCount
+        val tailMeanX = tailX.toFloat() / tailCount
+        val headMeanY = headY.toFloat() / headCount
+        val tailMeanY = tailY.toFloat() / tailCount
+        val rise = tailMeanY - headMeanY
+        if (rise < MIN_LEAN_RISE) return null
+        return Math.toDegrees(atan(((headMeanX - tailMeanX) / rise).toDouble())).toFloat()
+    }
+
+    /**
+     * Median whitespace between glyph clusters, measured straight on the ink
+     * mask. Faint display caps lose most OCR symbol boxes, and then only the
+     * region's own pixels still show the tracking the page was set with.
+     * Null when the projection is too sparse to trust.
+     */
+    fun stemGapPx(
+        mask: BooleanArray,
+        width: Int,
+        height: Int,
+        lines: List<TextLineSpan>,
+        sizePx: Float,
+    ): Float? {
+        if (width < MIN_TRACKING_WIDTH || height < 6 || mask.size < width * height) return null
+        if (sizePx < MIN_TRACKING_PROBE_SIZE) return null
+        val bridge = (sizePx * TRACKING_BRIDGE_RATIO).roundToInt()
+        val gaps = ArrayList<Float>()
+        lines.forEach { span ->
+            val left = span.left.coerceIn(0, width)
+            val right = span.right.coerceIn(left + 1, width)
+            val top = span.top.coerceIn(0, height)
+            val bottom = span.bottom.coerceIn(top + 1, height)
+            if (right - left < sizePx * MIN_TRACKING_LINE_WIDTH_RATIO) return@forEach
+            if (bottom - top < sizePx * MIN_TRACKING_LINE_HEIGHT_RATIO) return@forEach
+            val columns = IntArray(right - left)
+            for (y in top until bottom) {
+                val row = y * width
+                for (x in left until right) if (mask[row + x]) columns[x - left]++
+            }
+            val peak = columns.maxOrNull() ?: return@forEach
+            if (peak < MIN_TRACKING_COLUMN_INK) return@forEach
+            val floor = max(1, (peak * TRACKING_COLUMN_SHARE).roundToInt())
+            val runs = columnRuns(columns, floor)
+            for (index in 1 until runs.size) {
+                val gap = runs[index].first - runs[index - 1].last - 1
+                // Whitespace narrower than the bridge is serif feet and kerning,
+                // not the tracking the layout is asking for; wider is a word gap.
+                if (gap > bridge && gap <= sizePx * MAX_TRACKING_GAP_RATIO) gaps += gap.toFloat()
+            }
+        }
+        if (gaps.size < MIN_TRACKING_GAPS) return null
+        return median(gaps)
+    }
+
+    private fun columnRuns(columns: IntArray, floor: Int): List<IntRange> {
+        val runs = ArrayList<IntRange>()
+        var start = -1
+        columns.forEachIndexed { index, value ->
+            if (value >= floor) {
+                if (start < 0) start = index
+            } else if (start >= 0) {
+                runs += start until index
+                start = -1
+            }
+        }
+        if (start >= 0) runs += start until columns.size
+        return runs
     }
 
     private data class SlantLine(
@@ -244,4 +427,24 @@ internal object FontShapeEstimator {
     private const val FINE_SLANT_STEP = 0.5f
     private const val MIN_SLANT_DEGREES = 4f
     private const val MIN_SLANT_GAIN = 0.06f
+
+    // Stem lean is confirmed cluster by cluster: a handful of glyph bodies has
+    // to agree before a line may be called oblique.
+    private const val MIN_LEAN_CLUSTER_WIDTH = 2
+    private const val MIN_LEAN_CLUSTERS = 5
+    private const val MIN_LEAN_ROWS = 5
+    private const val LEAN_BAND_SHARE = 0.25f
+    private const val MIN_LEAN_RISE = 3f
+
+    // Below this type size one antialiased pixel is a third of the glyph, so
+    // inter-stem gaps measured on the mask are noise rather than tracking.
+    private const val MIN_TRACKING_WIDTH = 12
+    private const val MIN_TRACKING_PROBE_SIZE = 10f
+    private const val MIN_TRACKING_LINE_WIDTH_RATIO = 3f
+    private const val MIN_TRACKING_LINE_HEIGHT_RATIO = 0.4f
+    private const val MIN_TRACKING_COLUMN_INK = 3
+    private const val TRACKING_COLUMN_SHARE = 0.2f
+    private const val TRACKING_BRIDGE_RATIO = 0.06f
+    private const val MAX_TRACKING_GAP_RATIO = 0.45f
+    private const val MIN_TRACKING_GAPS = 6
 }

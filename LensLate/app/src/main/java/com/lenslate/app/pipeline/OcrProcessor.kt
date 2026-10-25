@@ -31,6 +31,8 @@ import kotlinx.coroutines.tasks.await
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 enum class OcrEngineChoice { AUTO, LATIN, JAPANESE, CYRILLIC }
 
@@ -110,6 +112,7 @@ class OcrProcessor @Inject constructor(
         protectEmbeddedImages: Boolean = true,
         maxCyrillicPasses: Int = MAX_CYRILLIC_PREPROCESS_PASSES,
         lexicalRepair: Boolean = false,
+        refineLineGeometry: Boolean = false,
     ): ScanDocument {
         require(imageInfo.workingWidth == bitmap.width && imageInfo.workingHeight == bitmap.height) {
             "Image metadata does not match the OCR bitmap dimensions."
@@ -137,6 +140,7 @@ class OcrProcessor @Inject constructor(
                 aggressiveSanitizer = aggressiveSanitizer,
                 maxCyrillicPasses = maxCyrillicPasses,
                 lexicalRepair = lexicalRepair,
+                refineLineGeometry = refineLineGeometry,
             )
             OcrEngineChoice.CYRILLIC -> processCyrillic(
                 bitmap = bitmap,
@@ -148,6 +152,7 @@ class OcrProcessor @Inject constructor(
                 aggressiveSanitizer = aggressiveSanitizer,
                 maxCyrillicPasses = maxCyrillicPasses,
                 lexicalRepair = lexicalRepair,
+                refineLineGeometry = refineLineGeometry,
             )
             OcrEngineChoice.JAPANESE -> processMlKit(
                 bitmap = bitmap,
@@ -379,6 +384,7 @@ class OcrProcessor @Inject constructor(
         aggressiveSanitizer: Boolean = false,
         maxCyrillicPasses: Int = MAX_CYRILLIC_PREPROCESS_PASSES,
         lexicalRepair: Boolean = false,
+        refineLineGeometry: Boolean = false,
     ): ScanDocument {
         val fingerprint = try {
             tesseractEngine.recognize(bitmap, TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT)
@@ -412,6 +418,7 @@ class OcrProcessor @Inject constructor(
                 scanMode,
                 aggressiveSanitizer,
                 lexicalRepair,
+                refineLineGeometry,
             )
         }
         // A cheap probe decides the script before paying for every enhancement
@@ -460,6 +467,7 @@ class OcrProcessor @Inject constructor(
         aggressiveSanitizer: Boolean = false,
         maxCyrillicPasses: Int = MAX_CYRILLIC_PREPROCESS_PASSES,
         lexicalRepair: Boolean = false,
+        refineLineGeometry: Boolean = false,
     ): ScanDocument {
         val passes = try {
             recognizeCyrillicPasses(
@@ -490,6 +498,7 @@ class OcrProcessor @Inject constructor(
             scanMode = scanMode,
             aggressiveSanitizer = aggressiveSanitizer,
             lexicalRepair = lexicalRepair,
+            refineLineGeometry = refineLineGeometry,
         )
     }
 
@@ -626,6 +635,7 @@ class OcrProcessor @Inject constructor(
         scanMode: ScanMode,
         aggressiveSanitizer: Boolean = false,
         lexicalRepair: Boolean = false,
+        refineLineGeometry: Boolean = false,
     ): ScanDocument {
         if (passes.isEmpty()) {
             return ScanDocument(
@@ -697,14 +707,28 @@ class OcrProcessor @Inject constructor(
             sanitized.regions.map { it.copy(text = OcrTextRepair.repair(it.text)) },
             lexical = lexical,
         )
+        // Tesseract trims a line box to the characters it recognized, so a line
+        // rendered from such a box is squeezed or erased only under its ink.
+        // Re-measuring from the source pixels restores the real extents before
+        // the crop-based re-read and the appearance sampling look at them.
+        val aligned = if (refineLineGeometry) {
+            OcrLineBoxRefiner.refine(paragraphs, bitmap)
+        } else {
+            paragraphs
+        }
         // Fragments and junk are gone by now, so the refinement budget goes to
         // the paragraphs that survived and still read poorly.
-        val refined = refineCyrillicRegions(paragraphs, bitmap, lexical || lexicalRepair)
-            .map { it.copy(text = OcrTextRepair.repair(it.text)) }
+        val refined = refineCyrillicRegions(aligned, bitmap, lexical || lexicalRepair)
+            .map { region ->
+                // The colour splitter rebuilds a region's text from its line
+                // records, so punctuation repaired only at region level comes
+                // back raw and "·" turns into "-" again after a split.
+                region.withRepairedText { OcrTextRepair.repair(it) }
+            }
         // The lab may ask for lexicon-backed repair; the regular scan keeps the
         // recognized words untouched even when a model would prefer another form.
         val repaired = if (lexicalRepair) {
-            refined.map { it.copy(text = CyrillicLexicalRepair.repair(it.text)) }
+            refined.map { region -> region.withRepairedText { CyrillicLexicalRepair.repair(it) } }
         } else {
             refined
         }
@@ -716,10 +740,15 @@ class OcrProcessor @Inject constructor(
         repaired.forEach { region ->
             android.util.Log.i(
                 "LensLateOcr",
-                "region conf=${region.confidence} bounds=${region.bounds} text=${region.text.replace('\n', '/')}",
+                "region conf=${region.confidence} lines=${region.lines.size} " +
+                    "tops=${region.lines.mapNotNull { it.bounds?.top }} " +
+                    "bounds=${region.bounds} text=${region.text.replace('\n', '/')}",
             )
         }
-        val regions = attachAppearance(repaired.map(::markGeometry), bitmap)
+        val regions = attachAppearance(
+            OcrRegionSplitter.split(repaired.map(::markGeometry), bitmap),
+            bitmap,
+        )
         val contributingPasses = merged.contributingPassNames.ifEmpty { setOf(selected.name) }
         val summaries = passes.map { pass ->
             PreprocessingCandidate(
@@ -881,7 +910,7 @@ class OcrProcessor @Inject constructor(
             aggressiveSanitizer,
         )
         val paragraphs = OcrParagraphMerger.merge(
-            sanitized.regions.map { it.copy(text = OcrTextRepair.repair(it.text)) },
+            sanitized.regions.map { region -> region.withRepairedText { OcrTextRepair.repair(it) } },
         )
         val contributingPasses = merged.contributingPassNames.ifEmpty { setOf(selected.name) }
         val summaries = sanitizedPasses.map { pass ->
@@ -898,7 +927,10 @@ class OcrProcessor @Inject constructor(
         val experimentResults = if (experimentMode) summaries else emptyList()
         return ScanDocument(
             image = imageInfo,
-            regions = attachAppearance(paragraphs.map(::markGeometry), bitmap),
+            regions = attachAppearance(
+                OcrRegionSplitter.split(paragraphs.map(::markGeometry), bitmap),
+                bitmap,
+            ),
             preprocessing = PreprocessingSummary(
                 quality = plan.quality.toEstimate(),
                 candidates = summaries,
@@ -1177,7 +1209,8 @@ class OcrProcessor @Inject constructor(
                 // look at its own crop can fix, so suspicion schedules refinement too.
                 confidence < CYRILLIC_REFINEMENT_CONFIDENCE ||
                     quality < qualityFloor ||
-                    (lexical && CyrillicReadingPlausibility.isSuspectReading(region.text))
+                    (lexical && CyrillicReadingPlausibility.isSuspectReading(region.text)) ||
+                    hasUncoveredInk(region)
             }
             .sortedBy { (_, region) ->
                 val quality = if (lexical) {
@@ -1194,6 +1227,26 @@ class OcrProcessor @Inject constructor(
         return regions.mapIndexed { index, region ->
             if (index !in targets) region else refineCyrillicRegion(region, bitmap, plan, lexical)
         }
+    }
+
+    /**
+     * OCR can stop short of the printed line: the line box covers ink the
+     * recognized symbols never reached, which usually means a missed word end.
+     * Such a reading deserves a second look even when its confidence is high.
+     */
+    private fun hasUncoveredInk(region: TextRegionRecord): Boolean {
+        region.lines.forEach { line ->
+            val bounds = line.bounds ?: return@forEach
+            val lastRight = line.elements
+                .flatMap { it.symbols }
+                .mapNotNull { symbol -> symbol.bounds?.right }
+                .maxOrNull() ?: return@forEach
+            val height = (bounds.bottom - bounds.top).coerceAtLeast(1f)
+            if (bounds.right - lastRight > maxOf(height * UNCOVERED_INK_LINE_RATIO, MIN_UNCOVERED_INK)) {
+                return true
+            }
+        }
+        return false
     }
 
     private suspend fun refineCyrillicRegion(
@@ -1259,9 +1312,100 @@ class OcrProcessor @Inject constructor(
                     }
                     for (mode in modes) {
                         val refinedRegions = tesseractEngine.recognize(prepared, mode)
-                        val text = refinedRegions
-                            .joinToString("\n") { it.text.trim() }
-                            .trim()
+                        // The crop carries padding, so Tesseract also reads the
+                        // neighbouring lines. Readings are aligned back onto the
+                        // original line records: a refined word may only replace
+                        // the line whose ink it covers, and text that lands outside
+                        // the block is dropped instead of growing the paragraph.
+                        val preparedScale = prepared.width.toFloat() /
+                            scaled.width.coerceAtLeast(1)
+                        val cropScale = scale * preparedScale
+                        val blockTop = (bounds.top - top) * cropScale
+                        val blockBottom = (bounds.bottom - top) * cropScale
+                        val blockLeft = (bounds.left - left) * cropScale
+                        val blockRight = (bounds.right - left) * cropScale
+                        val referenceLine = region.lines
+                            .firstOrNull { it.bounds != null }
+                            ?.bounds
+                            ?.height
+                            ?: bounds.height
+                        val tolerance = (referenceLine * cropScale * REFINEMENT_LINE_TOLERANCE)
+                            .coerceAtLeast(4f)
+                        val refinedLines = refinedRegions.flatMap { candidate ->
+                            candidate.lines.ifEmpty {
+                                listOf(
+                                    TextLineRecord(
+                                        text = candidate.text,
+                                        bounds = candidate.bounds,
+                                        polygon = candidate.polygon,
+                                        angleDegrees = null,
+                                        confidence = candidate.confidence,
+                                        elements = emptyList(),
+                                    ),
+                                )
+                            }
+                        }
+                        val originalLines = region.lines.filter { it.bounds != null }
+                        val assigned = linkedMapOf<TextLineRecord, MutableList<String>>()
+                        refinedLines.forEach { refinedLine ->
+                            val box = refinedLine.bounds ?: return@forEach
+                            val lineHeight = (box.bottom - box.top).coerceAtLeast(1f)
+                            val lineCenter = (box.top + box.bottom) / 2f
+                            if (lineCenter < blockTop - tolerance ||
+                                lineCenter > blockBottom + tolerance
+                            ) {
+                                return@forEach
+                            }
+                            val horizontal = min(box.right, blockRight) - max(box.left, blockLeft)
+                            if (horizontal < (box.right - box.left) * MIN_REFINED_LINE_WIDTH_SHARE) {
+                                return@forEach
+                            }
+                            val target = originalLines
+                                .maxByOrNull { original ->
+                                    val originalBox = original.bounds
+                                        ?: return@maxByOrNull -Float.MAX_VALUE
+                                    val originalTop = (originalBox.top - top) * cropScale
+                                    val originalBottom = (originalBox.bottom - top) * cropScale
+                                    min(originalBottom, box.bottom) - max(originalTop, box.top)
+                                }
+                                ?: return@forEach
+                            val targetBox = target.bounds ?: return@forEach
+                            val targetTop = (targetBox.top - top) * cropScale
+                            val targetBottom = (targetBox.bottom - top) * cropScale
+                            val targetHeight = (targetBottom - targetTop).coerceAtLeast(1f)
+                            // A tall Tesseract box can straddle the block edge and
+                            // still overlap the first line by a few pixels while
+                            // carrying the text of the line above. The box centre
+                            // must sit on the target line, not merely touch it.
+                            val centerMargin = targetHeight * REFINEMENT_LINE_CENTER_MARGIN
+                            val center = (box.top + box.bottom) / 2f
+                            if (center < targetTop - centerMargin || center > targetBottom + centerMargin) {
+                                return@forEach
+                            }
+                            val overlap = min(targetBottom, box.bottom) - max(targetTop, box.top)
+                            if (overlap < lineHeight * MIN_REFINED_LINE_OVERLAP) return@forEach
+                            val cleaned = cleanRefinedLine(refinedLine.text, target.text)
+                            if (cleaned.isEmpty()) return@forEach
+                            assigned.getOrPut(target) { mutableListOf() } += cleaned
+                        }
+                        // Without a single line pinned to the block, the crop read
+                        // only its neighbours: adopting that text grew paragraphs
+                        // with the line above or the heading below them.
+                        if (assigned.isEmpty() && originalLines.isNotEmpty()) continue
+                        val text = if (assigned.isEmpty()) {
+                            refinedRegions.joinToString("\n") { it.text.trim() }.trim()
+                        } else {
+                            originalLines
+                                .sortedBy { line -> line.bounds?.top ?: 0f }
+                                .joinToString("\n") { line ->
+                                    assigned[line]
+                                        ?.filter(String::isNotBlank)
+                                        ?.joinToString(" ")
+                                        ?.takeIf { text -> text.any(Char::isLetterOrDigit) }
+                                        ?: line.text
+                                }
+                                .trim()
+                        }
                         if (text.isBlank()) continue
                         if (!CyrillicReadingPlausibility.isUsableReading(text)) continue
                         // A tight crop also catches neighbouring decoration. A long
@@ -1288,7 +1432,22 @@ class OcrProcessor @Inject constructor(
                         ) {
                             continue
                         }
-                        best = region.copy(text = text, confidence = confidence)
+                        val refinedLinesForRecord = if (assigned.isEmpty()) {
+                            region.lines
+                        } else {
+                            region.lines.map { line ->
+                                val replacement = assigned[line]
+                                    ?.filter(String::isNotBlank)
+                                    ?.joinToString(" ")
+                                if (replacement.isNullOrBlank()) line
+                                else line.copy(text = replacement)
+                            }
+                        }
+                        best = region.copy(
+                            text = text,
+                            confidence = confidence,
+                            lines = refinedLinesForRecord,
+                        )
                         bestScore = maxOf(bestScore, score)
                         if (score >= GOOD_REFINED_READING && confidence != null &&
                             confidence >= GOOD_REFINED_CONFIDENCE
@@ -1337,6 +1496,12 @@ class OcrProcessor @Inject constructor(
 
     private fun normalizedLetters(text: String): Int = text.count(Char::isLetter)
 
+    private fun TextRegionRecord.withRepairedText(repair: (String) -> String): TextRegionRecord =
+        copy(
+            text = repair(text),
+            lines = lines.map { line -> line.copy(text = repair(line.text)) },
+        )
+
     private fun hasRealWords(text: String): Boolean {
         val tokens = text.split(REFINEMENT_TOKEN_SEPARATOR)
             .filter { token -> token.any(Char::isLetterOrDigit) }
@@ -1350,6 +1515,20 @@ class OcrProcessor @Inject constructor(
             token.count(Char::isLetter) == 1 && token.none(Char::isDigit)
         }
         return singleLetters <= MAX_REFINED_SINGLE_LETTERS
+    }
+
+    /**
+     * Refined lines are glued to the original line boxes, so a stray bullet or
+     * speck caught by the crop arrives as leading punctuation. Drop it only
+     * when the source line itself started with a word or a number.
+     */
+    private fun cleanRefinedLine(text: String, original: String): String {
+        val trimmed = text.trim()
+        val sourceStartsMeaningful = original.trimStart()
+            .firstOrNull { it.isLetterOrDigit() } != null
+        if (!sourceStartsMeaningful) return trimmed
+        val cleaned = trimmed.trimStart { !it.isLetterOrDigit() }
+        return cleaned.takeIf { it.any(Char::isLetterOrDigit) } ?: trimmed
     }
 
     private fun markGeometry(region: TextRegionRecord): TextRegionRecord {
@@ -1494,7 +1673,13 @@ class OcrProcessor @Inject constructor(
         const val CYRILLIC_REFINEMENT_HEIGHT = 96f
         const val CYRILLIC_REFINEMENT_MAX_UPSCALE = 3f
         const val CYRILLIC_REFINEMENT_MIN_GAIN = 0.03f
+        const val UNCOVERED_INK_LINE_RATIO = 0.6f
+        const val MIN_UNCOVERED_INK = 10f
         const val REFINEMENT_COMPLETION_GAIN = 1.25f
+        const val REFINEMENT_LINE_TOLERANCE = 0.35f
+        const val REFINEMENT_LINE_CENTER_MARGIN = 0.15f
+        const val MIN_REFINED_LINE_WIDTH_SHARE = 0.3f
+        const val MIN_REFINED_LINE_OVERLAP = 0.35f
         const val PLAUSIBLE_ORIGINAL_READING = 0.7f
         const val GOOD_REFINED_READING = 0.82f
         const val GOOD_REFINED_CONFIDENCE = 0.8f

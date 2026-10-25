@@ -13,6 +13,7 @@ import com.lenslate.app.model.TextRegionRecord
 import java.util.Random
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
@@ -91,6 +92,18 @@ class BackgroundRestorer @Inject constructor() {
                 elements.isNotEmpty() -> elements.forEach { drawUnit(canvas, paint, it.polygon, it.bounds) }
                 lines.isNotEmpty() -> lines.forEach { drawUnit(canvas, paint, it.polygon, it.bounds) }
                 else -> drawUnit(canvas, paint, region.polygon, region.bounds)
+            }
+            // Tesseract boxes can stop short of the printed line, while the
+            // line box now covers the full ink. Upright line boxes are the
+            // printed strip itself, so allowing them lets the classifier reach
+            // glyphs the symbol boxes never covered.
+            if (lines.isNotEmpty()) {
+                lines.forEach { line ->
+                    val angle = line.angleDegrees ?: 0f
+                    if (angle.isFinite() && abs(angle) < MAX_UPRIGHT_LINE_DEGREES) {
+                        drawUnit(canvas, paint, line.polygon, line.bounds)
+                    }
+                }
             }
         }
 
@@ -199,6 +212,7 @@ class BackgroundRestorer @Inject constructor() {
                     inkCount++
                 }
             }
+            logErase(region, references, maxContrast, background, inkCount, allowedCount, "whole")
             return inkCount > 0
         }
         if (references.isEmpty() || maxContrast < MIN_CLASSIFIABLE_CONTRAST_SQ) {
@@ -235,6 +249,8 @@ class BackgroundRestorer @Inject constructor() {
         }
         if (inkCount == 0) return false
 
+        logErase(region, references, maxContrast, background, inkCount, allowedCount, "classify")
+
         val dilated = dilate(mask, cropWidth, cropHeight, dilationRadius)
         for (y in 0 until cropHeight) {
             val cropRow = y * cropWidth
@@ -244,6 +260,23 @@ class BackgroundRestorer @Inject constructor() {
             }
         }
         return true
+    }
+
+    private fun logErase(
+        region: TextRegionRecord,
+        references: List<Int>,
+        maxContrast: Float,
+        background: Int,
+        inkCount: Int,
+        allowedCount: Int,
+        mode: String,
+    ) {
+        if (!DEBUG_ERASE) return
+        android.util.Log.d(
+            "LensLateErase",
+            "«${region.text.take(18)}» mode=$mode refs=${references.size} contrast=$maxContrast " +
+                "bg=${Integer.toHexString(background)} ink=$inkCount/$allowedCount",
+        )
     }
 
     private fun copyAllowed(allowed: BooleanArray, output: BooleanArray) {
@@ -868,6 +901,7 @@ class BackgroundRestorer @Inject constructor() {
     private data class RaySample(val color: Int, val distance: Float)
 
     private companion object {
+        const val DEBUG_ERASE = false
         const val DEFAULT_PADDING_PX = 2
         const val MASK_DILATION = 2
         const val MAX_BACKGROUND_SAMPLES = 40_000
@@ -876,7 +910,7 @@ class BackgroundRestorer @Inject constructor() {
         const val MIN_INK_REFERENCE_DISTANCE_SQ = 0.0018f
         const val MAX_INK_REFERENCES = 16
         const val MIN_CLASSIFIABLE_CONTRAST_SQ = 0.0025f
-        const val FULL_BLOCK_ERASE_CONTRAST_SQ = 0.03f
+        const val FULL_BLOCK_ERASE_CONTRAST_SQ = 0.05f
         const val EDGE_INK_SHARE = 0.14f
         const val STRONG_INK_SHARE = 0.55f
         const val MIN_EDGE_THRESHOLD_SQ = 0.0015f
@@ -886,6 +920,7 @@ class BackgroundRestorer @Inject constructor() {
         const val INK_VS_BACKGROUND_RATIO = 0.94f
         const val MIN_FALLBACK_AREA = 40
         const val MIN_REGION_INK_SHARE = 0.03f
+        const val MAX_UPRIGHT_LINE_DEGREES = 2f
 
         const val DISTANCE_FALLOFF = 0.06
         const val PAIRED_BOOST = 1.7

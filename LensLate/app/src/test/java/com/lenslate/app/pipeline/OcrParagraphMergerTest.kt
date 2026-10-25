@@ -230,6 +230,28 @@ class OcrParagraphMergerTest {
     }
 
     @Test
+    fun duplicateOverlappingLineRecordsAreDropped() {
+        val base = block(
+            id = 1,
+            text = "ПОЛНАЯ\nТЕМНОТА",
+            left = 70f, top = 700f, right = 640f, bottom = 800f,
+            lineTexts = listOf("ПОЛНАЯ", "ТЕМНОТА"),
+        )
+        // A second pass emitted the same first line with a few pixels of
+        // vertical drift; both copies used to become separate render frames.
+        val duplicate = base.lines.first().copy(
+            bounds = Bounds2D(72f, 706f, 640f, 752f),
+            polygon = polygon(72f, 706f, 640f, 752f),
+        )
+        val region = base.copy(lines = base.lines + duplicate)
+
+        val result = OcrParagraphMerger.merge(listOf(region))
+
+        assertEquals(1, result.size)
+        assertEquals(listOf("ПОЛНАЯ", "ТЕМНОТА"), result[0].lines.map { it.text })
+    }
+
+    @Test
     fun adjacentRepeatedLineIsAbsorbedIntoParagraphBounds() {
         val paragraph = region(
             1,
@@ -250,5 +272,17 @@ class OcrParagraphMergerTest {
         assertEquals(paragraph.text, result[0].text)
         assertEquals(913f, result[0].bounds.top, 0.01f)
         assertEquals(2, result[0].lines.size)
+    }
+
+    @Test
+    fun scannerSliverCannotFormALineOfItsOwn() {
+        val heading = region(1, "ТЕМНОТА", 105f, 700f, 640f, 750f, confidence = 0.6f)
+        val sliver = region(2, "Т", 64f, 700f, 120f, 702f, confidence = 0.3f)
+
+        val result = OcrParagraphMerger.merge(listOf(heading, sliver))
+
+        assertEquals(1, result.size)
+        assertEquals(listOf("ТЕМНОТА"), result[0].lines.map { it.text })
+        assertEquals(105f, result[0].bounds.left, 0.01f)
     }
 }

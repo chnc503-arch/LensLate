@@ -30,6 +30,7 @@ import com.lenslate.app.pipeline.OcrEngineChoice
 import com.lenslate.app.pipeline.OcrExperimentResult
 import com.lenslate.app.pipeline.OcrProcessor
 import com.lenslate.app.pipeline.ScanTranslationPolicy
+import com.lenslate.app.pipeline.SmartRunTrace
 import com.lenslate.app.pipeline.SmartScanQuality
 import com.lenslate.app.pipeline.StyleStressLab
 import com.lenslate.app.pipeline.TextRenderer
@@ -539,7 +540,7 @@ class ScanViewModel @Inject constructor(
                 refreshModelPacks()
                 val pair = TranslationPair(from = effectiveSource, to = target)
                 val protectedCount = document.regions.count { it.isProtected }
-                val translatableIndices = ScanTranslationPolicy.selectableIndices(document.regions)
+                val translatableIndices = ScanTranslationPolicy.selectableIndices(document.regions, bitmap)
                 if (translatableIndices.isEmpty()) {
                     mutate {
                         it.copy(
@@ -812,6 +813,9 @@ class ScanViewModel @Inject constructor(
             val startedAt = SystemClock.elapsedRealtime()
             val stages = mutableListOf<SmartLabStage>()
             try {
+                lastLabPage?.let {
+                    writeLabTrace(it, SmartRunTrace.report(it, isDebuggableBuild(), emptyList(), emptyList(), null))
+                }
                 val imageInfo = snapshot.imageInfo
                     ?: ScanImageInfo.identity(bitmap.width, bitmap.height)
                 val imageArea = bitmap.width.toFloat() * bitmap.height.toFloat()
@@ -829,6 +833,7 @@ class ScanViewModel @Inject constructor(
                         protectEmbeddedImages = snapshot.protectEmbeddedImages,
                         aggressiveSanitizer = snapshot.aggressiveSanitizer,
                         lexicalRepair = true,
+                        refineLineGeometry = true,
                     )
                 }
                 var fastScore = SmartScanQuality.score(document.regions, imageArea, lexical = true)
@@ -857,6 +862,7 @@ class ScanViewModel @Inject constructor(
                                 protectEmbeddedImages = snapshot.protectEmbeddedImages,
                                 aggressiveSanitizer = snapshot.aggressiveSanitizer,
                                 lexicalRepair = true,
+                                refineLineGeometry = true,
                             )
                         }
                     } catch (cancelled: CancellationException) {
@@ -888,7 +894,26 @@ class ScanViewModel @Inject constructor(
                 }
 
                 stepStarted = SystemClock.elapsedRealtime()
-                val translatable = ScanTranslationPolicy.selectableIndices(document.regions)
+                val translatable = ScanTranslationPolicy.selectableIndices(document.regions, bitmap)
+                val keptIndices = translatable.toHashSet()
+                val traced = lastLabPage != null || isDebuggableBuild()
+                val keptReasons = if (traced) {
+                    document.regions.mapIndexedNotNull { index, region ->
+                        if (index in keptIndices) null
+                        else index to ScanTranslationPolicy.rejectionReason(region, bitmap)
+                    }.toMap()
+                } else {
+                    emptyMap()
+                }
+                if (isDebuggableBuild()) {
+                    keptReasons.forEach { (index, reason) ->
+                        Log.d(
+                            "LensLateTr",
+                            "keep original #$index $reason «" +
+                                document.regions[index].text.replace('\n', '/').take(30) + "»",
+                        )
+                    }
+                }
                 val outcomes = withContext(Dispatchers.Default) {
                     translationEngine.translateBatch(
                         texts = translatable.map { document.regions[it].text },
@@ -942,8 +967,11 @@ class ScanViewModel @Inject constructor(
                     detail = if (replaceable.isEmpty()) "без изменений" else "готова",
                     durationMs = SystemClock.elapsedRealtime() - stepStarted,
                 )
-                if (isDebuggableBuild()) {
-                    debugSmartRun(translatedDocument, rendered, stages, lastLabPage)
+                val page = lastLabPage
+                if (page != null || isDebuggableBuild()) {
+                    withContext(Dispatchers.IO) {
+                        debugSmartRun(translatedDocument, rendered, stages, page, keptReasons)
+                    }
                 }
 
                 val result = SmartLabResult(
@@ -1130,32 +1158,61 @@ class ScanViewModel @Inject constructor(
         rendered: Bitmap,
         stages: List<SmartLabStage>,
         page: String?,
+        keptReasons: Map<Int, String?>,
     ) {
-        val tag = "LensLateSmart"
-        document.regions.forEach { region ->
-            val appearance = region.appearance
-            val color = appearance?.foregroundArgb?.let { "#%06X".format(it and 0xFFFFFF) }
-            val background = appearance?.localBackgroundArgb?.let { "#%06X".format(it and 0xFFFFFF) }
-            Log.i(
-                tag,
-                "text=${region.text.replace('\n', '/')} | tr=${region.translation?.replace('\n', '/')} | " +
-                    "conf=${region.confidence} | color=$color | bg=$background | " +
-                    "font=${appearance?.fontKey} | weight=${appearance?.fontWeight} | " +
-                    "size=${appearance?.textHeightPx} | spacing=${appearance?.spacingPx} | " +
-                    "slant=${appearance?.slantDegrees} | bounds=${region.bounds}",
+        val blocks = document.regions.mapIndexed { index, region ->
+            val look = region.appearance
+            SmartRunTrace.Block(
+                text = region.text,
+                translation = region.translation,
+                confidence = region.confidence,
+                style = if (look == null) {
+                    "none"
+                } else {
+                    "color=${look.foregroundArgb?.hex()}" +
+                        " bg=${look.localBackgroundArgb?.hex()}" +
+                        " font=${look.fontKey}" +
+                        " weight=${look.fontWeight}" +
+                        " size=${look.textHeightPx}" +
+                        " cap=${look.capHeightPx}" +
+                        " stroke=${look.strokeWidthPx}" +
+                        " fscore=${look.fontMatchScore}" +
+                        " spacing=${look.spacingPx}" +
+                        " slant=${look.slantDegrees}"
+                },
+                bounds = region.bounds.toString(),
+                note = keptReasons[index],
+                rows = ScanTranslationPolicy.fitRows(region),
             )
         }
-        stages.forEach { stage ->
-            Log.i(tag, "stage=${stage.title} ${stage.durationMs}ms · ${stage.detail}")
+        val png = page?.let { name ->
+            runCatching {
+                val file = File(labDebugDir(), "smart_${name.substringBeforeLast('.')}_out.png")
+                file.outputStream().use { rendered.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                file.absolutePath
+            }.getOrNull()
         }
-        runCatching {
-            val dir = File(context.getExternalFilesDir(LAB_PAGES_DIR), "debug").apply { mkdirs() }
-            val base = page?.substringBeforeLast('.') ?: "photo"
-            val file = File(dir, "smart_${base}_out.png")
-            file.outputStream().use { rendered.compress(Bitmap.CompressFormat.PNG, 100, it) }
-            Log.i(tag, "saved=${file.absolutePath}")
-        }.onFailure { Log.i(tag, "save failed: ${it.message}") }
+        val report = SmartRunTrace.report(
+            page = page ?: "photo",
+            debuggable = isDebuggableBuild(),
+            blocks = blocks,
+            stages = stages.map { SmartRunTrace.Stage(it.title, it.durationMs, it.detail) },
+            png = png,
+        )
+        page?.let { writeLabTrace(it, report) }
+        if (isDebuggableBuild()) {
+            report.lineSequence().filter { it.isNotBlank() }.forEach { Log.i("LensLateSmart", it) }
+        }
     }
+
+    private fun Int.hex(): String = "#%06X".format(this and 0xFFFFFF)
+
+    private fun writeLabTrace(page: String, report: String) {
+        runCatching { File(labDebugDir(), "smart_${page.substringBeforeLast('.')}_trace.txt").writeText(report) }
+    }
+
+    private fun labDebugDir(): File =
+        File(context.getExternalFilesDir(LAB_PAGES_DIR), "debug").apply { mkdirs() }
 
     private companion object {
         const val APPROXIMATE_MODEL_MB = 30
