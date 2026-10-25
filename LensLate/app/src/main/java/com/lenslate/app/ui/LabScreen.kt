@@ -94,10 +94,16 @@ internal fun LabScreen(
     onAggressiveSanitizer: (Boolean) -> Unit,
     onPreviewProtection: () -> Unit,
     onRunStyleStress: () -> Unit,
+    onRunSmart: () -> Unit,
+    onClearSmart: () -> Unit,
+    onLoadLabPage: (String) -> Unit,
+    onRefreshLabPages: () -> Unit,
 ) {
     var engineName by rememberSaveable { mutableStateOf(OcrEngineChoice.AUTO.name) }
     val engine = OcrEngineChoice.entries.firstOrNull { it.name == engineName }
         ?: OcrEngineChoice.AUTO
+
+    androidx.compose.runtime.LaunchedEffect(Unit) { onRefreshLabPages() }
 
     LazyColumn(
         modifier = Modifier
@@ -118,6 +124,25 @@ internal fun LabScreen(
     ) {
         item {
             LabIntroCard()
+        }
+
+        item {
+            SmartScanCard(
+                state = state,
+                onRun = onRunSmart,
+                onClear = onClearSmart,
+            )
+        }
+
+        if (state.labPages.isNotEmpty()) {
+            item {
+                LabPagesCard(
+                    pages = state.labPages,
+                    enabled = !state.isBusy,
+                    onLoad = onLoadLabPage,
+                    onRefresh = onRefreshLabPages,
+                )
+            }
         }
 
         state.appliedExperiment?.let { applied ->
@@ -338,6 +363,369 @@ private fun LabIntroCard() {
         }
     }
 }
+
+@Composable
+private fun SmartScanCard(
+    state: ScanUiState,
+    onRun: () -> Unit,
+    onClear: () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    var showOriginal by rememberSaveable { mutableStateOf(false) }
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = colors.surface,
+        border = BorderStroke(1.dp, colors.primary.copy(alpha = 0.45f)),
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Outlined.AutoAwesome,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                    tint = colors.primary,
+                )
+                Spacer(Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Умный скан · прототип основы",
+                        fontSize = 13.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = colors.onSurface,
+                    )
+                    Text(
+                        text = "полный автомат: фон → OCR → перевод → отрисовка",
+                        fontSize = 10.sp,
+                        color = colors.onSurfaceVariant,
+                    )
+                }
+                Text(
+                    text = "авто",
+                    fontSize = 9.5.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = colors.primary,
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "Одна кнопка прогоняет весь перевод без выбора вариантов: при слабом " +
+                    "чтении автоматически запускается глубокий проход по всем рецептам фона " +
+                    "и остаётся тот результат, который выше по качеству. Обычный скан эта " +
+                    "карточка не меняет — это предпросмотр будущего этапа.",
+                fontSize = 11.sp,
+                lineHeight = 16.sp,
+                color = colors.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = {
+                    showOriginal = false
+                    onRun()
+                },
+                enabled = state.hasImage && !state.isBusy,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(40.dp),
+                shape = RoundedCornerShape(8.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = colors.primary,
+                    contentColor = colors.onPrimary,
+                ),
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.PlayArrow,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                )
+                Spacer(Modifier.width(7.dp))
+                Text(
+                    text = if (state.smartRunning) "Считаем на телефоне…" else "Запустить умный перевод",
+                    fontSize = 12.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+            }
+            if (!state.hasImage) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Сначала загрузите снимок в основной вкладке или тестовую страницу ниже.",
+                    fontSize = 10.5.sp,
+                    lineHeight = 14.sp,
+                    color = colors.onSurfaceVariant,
+                )
+            }
+            if (state.smartRunning) {
+                Spacer(Modifier.height(10.dp))
+                LinearProgressIndicator(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(3.dp)
+                        .clip(RoundedCornerShape(2.dp)),
+                    color = colors.primary,
+                    trackColor = colors.surfaceVariant,
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Подбираем фон и гипотезы OCR, переводим и рисуем…",
+                    fontSize = 10.5.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = colors.onSurfaceVariant,
+                )
+            }
+            state.smartResult?.let { result ->
+                Spacer(Modifier.height(12.dp))
+                HorizontalDivider(color = colors.outlineVariant.copy(alpha = 0.55f))
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(
+                        onClick = { showOriginal = !showOriginal },
+                        contentPadding = PaddingValues(horizontal = 6.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Visibility,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            text = if (showOriginal) "Показать перевод" else "Показать оригинал",
+                            fontSize = 11.sp,
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        text = "${result.translated}/${result.total} · ${formatDuration(result.totalMs)}",
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = colors.onSurfaceVariant,
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+                Image(
+                    bitmap = (if (showOriginal) result.original else result.rendered).asImageBitmap(),
+                    contentDescription = if (showOriginal) "Оригинал" else "Умный перевод",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 420.dp)
+                        .background(colors.surfaceVariant.copy(alpha = 0.3f)),
+                    contentScale = ContentScale.Fit,
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "качество ${formatPercent(result.fastScore)} → " +
+                            "${formatPercent(result.chosenScore)}",
+                        modifier = Modifier.weight(1f),
+                        fontSize = 10.5.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = colors.primary,
+                    )
+                    Text(
+                        text = if (result.deepPassUsed) "глубокий проход" else "хватило быстрого",
+                        fontSize = 9.5.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = colors.onSurfaceVariant,
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                result.stages.forEach { stage ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = stage.title,
+                            modifier = Modifier.width(128.dp),
+                            fontSize = 10.5.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = colors.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = stage.detail,
+                            modifier = Modifier.weight(1f),
+                            fontSize = 10.sp,
+                            color = colors.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = formatDuration(stage.durationMs),
+                            fontSize = 9.5.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = colors.onSurfaceVariant,
+                        )
+                    }
+                }
+                val shown = result.document.regions
+                    .filter { !it.translation.isNullOrBlank() }
+                    .take(6)
+                if (shown.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = "Стиль наложения",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = colors.onSurface,
+                    )
+                    shown.forEach { region ->
+                        Column(modifier = Modifier.padding(top = 5.dp)) {
+                            Text(
+                                text = "${region.text.replace('\n', ' ')} → " +
+                                    region.translation.orEmpty().replace('\n', ' '),
+                                fontSize = 10.5.sp,
+                                lineHeight = 14.sp,
+                                color = colors.onSurface,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = regionStyleLine(region),
+                                fontSize = 9.5.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = colors.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                    if (result.document.regions.size > shown.size) {
+                        Text(
+                            text = "и ещё ${result.document.regions.size - shown.size} блоков…",
+                            modifier = Modifier.padding(top = 4.dp),
+                            fontSize = 9.5.sp,
+                            color = colors.onSurfaceVariant,
+                        )
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                TextButton(
+                    onClick = onClear,
+                    contentPadding = PaddingValues(horizontal = 6.dp),
+                ) {
+                    Text("Скрыть результат", fontSize = 11.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LabPagesCard(
+    pages: List<String>,
+    enabled: Boolean,
+    onLoad: (String) -> Unit,
+    onRefresh: () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = colors.surface,
+        border = BorderStroke(1.dp, colors.outlineVariant.copy(alpha = 0.7f)),
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Outlined.Image,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                    tint = colors.primary,
+                )
+                Spacer(Modifier.width(7.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Тестовые страницы",
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = colors.onSurface,
+                    )
+                    Text(
+                        text = "папка приложения, не галерея",
+                        fontSize = 9.5.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = colors.onSurfaceVariant,
+                    )
+                }
+                TextButton(
+                    onClick = onRefresh,
+                    contentPadding = PaddingValues(horizontal = 6.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(14.dp),
+                    )
+                    Spacer(Modifier.width(3.dp))
+                    Text("Обновить", fontSize = 10.5.sp)
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = "Нажмите, чтобы загрузить страницу в скан. Личные фото и галерея " +
+                    "не используются.",
+                fontSize = 10.5.sp,
+                lineHeight = 14.sp,
+                color = colors.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            pages.forEach { name ->
+                OutlinedButton(
+                    onClick = { onLoad(name) },
+                    enabled = enabled,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(34.dp),
+                    shape = RoundedCornerShape(7.dp),
+                    border = BorderStroke(1.dp, colors.primary.copy(alpha = 0.45f)),
+                    contentPadding = PaddingValues(horizontal = 10.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.Image,
+                        contentDescription = null,
+                        modifier = Modifier.size(13.dp),
+                        tint = colors.primary,
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = name,
+                        modifier = Modifier.weight(1f),
+                        fontSize = 11.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = colors.primary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Start,
+                    )
+                }
+                Spacer(Modifier.height(6.dp))
+            }
+        }
+    }
+}
+
+private fun regionStyleLine(region: TextRegionRecord): String {
+    val appearance = region.appearance ?: return "стиль не оценён"
+    val font = appearance.fontKey ?: appearance.likelyFontClass ?: "шрифт?"
+    val weight = appearance.fontWeight?.toString() ?: appearance.weight ?: "вес?"
+    val size = appearance.textHeightPx?.roundToInt()?.toString() ?: "?"
+    val color = appearance.foregroundArgb?.let { value ->
+        String.format(Locale.US, "#%06X", value and 0xFFFFFF)
+    } ?: "цвет?"
+    val slant = appearance.slantDegrees
+        ?.takeIf { kotlin.math.abs(it) >= 3f }
+        ?.let { ", наклон ${it.roundToInt()}°" }
+        .orEmpty()
+    return "$font · $weight · ${size}px · $color$slant"
+}
+
+private fun formatDuration(milliseconds: Long): String =
+    if (milliseconds >= 1000) String.format(Locale.US, "%.1f с", milliseconds / 1000f)
+    else "$milliseconds мс"
 
 @Composable
 private fun FeaturePill(text: String, icon: androidx.compose.ui.graphics.vector.ImageVector) {
@@ -830,7 +1218,7 @@ private fun OverlayStressCard(
                         color = colors.onSurface,
                     )
                     Text(
-                        text = "4 сложных кейса считаются прямо на телефоне",
+                        text = "6 сложных кейсов считаются прямо на телефоне",
                         fontSize = 10.sp,
                         color = colors.onSurfaceVariant,
                     )
@@ -839,10 +1227,10 @@ private fun OverlayStressCard(
             }
             Spacer(Modifier.height(8.dp))
             Text(
-                text = "Один и тот же пиксельный кейс прогоняется тремя способами: " +
+                text = "Один и тот же пиксельный кейс прогоняется четырьмя способами: " +
                     "общий фон страницы (как было), локальный фон под каждым глифом " +
-                    "(сейчас в скане) и пиковый сэмплер — экспериментальный режим для " +
-                    "замыленного, пересвеченного и почти сливающегося текста.",
+                    "(прежний скан), адаптивный (сейчас в скане: локальный для обычных " +
+                    "глифов, пиковый только для еле различимых чернил) и чистый пиковый сэмплер.",
                 fontSize = 11.sp,
                 lineHeight = 16.sp,
                 color = colors.onSurfaceVariant,
@@ -906,9 +1294,8 @@ private fun OverlayStressCard(
                 }
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    text = "Пиковый способ пока живёт только в этом тесте. Скан " +
-                        "продолжает использовать локальный фон; включаем пиковый " +
-                        "только после вашего одобрения.",
+                    text = "Скан уже использует адаптивный способ. Локальный показан " +
+                        "как прежнее поведение, пиковый остаётся только в этом тесте.",
                     fontSize = 10.sp,
                     lineHeight = 14.sp,
                     color = colors.onSurfaceVariant,
@@ -923,12 +1310,12 @@ private fun StressCaseRow(case: StyleStressLab.CaseResult) {
     val colors = MaterialTheme.colorScheme
     val winner = when {
         !case.passed -> "риск"
-        case.peakError < case.localError -> "пик лучше"
-        else -> "скан лучше"
+        case.adaptiveError < case.localError -> "адаптивный лучше"
+        else -> "локальный лучше"
     }
     val winnerTint = when {
         !case.passed -> colors.error
-        case.peakError < case.localError -> colors.primary
+        case.adaptiveError < case.localError -> colors.primary
         else -> colors.onSurfaceVariant
     }
     Column {
@@ -956,21 +1343,27 @@ private fun StressCaseRow(case: StyleStressLab.CaseResult) {
         Spacer(Modifier.height(5.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
             StressMetric(
-                label = "общий фон",
+                label = "общий",
                 value = case.globalError,
                 highlighted = false,
                 modifier = Modifier.weight(1f),
             )
             StressMetric(
-                label = "локально · скан",
+                label = "локальный · было",
                 value = case.localError,
-                highlighted = case.localError <= case.peakError,
+                highlighted = case.localError <= case.adaptiveError,
                 modifier = Modifier.weight(1f),
             )
             StressMetric(
-                label = "пик · тест",
+                label = "адаптивный · скан",
+                value = case.adaptiveError,
+                highlighted = case.adaptiveError < case.localError,
+                modifier = Modifier.weight(1f),
+            )
+            StressMetric(
+                label = "пиковый · тест",
                 value = case.peakError,
-                highlighted = case.peakError < case.localError,
+                highlighted = case.peakError < case.adaptiveError,
                 modifier = Modifier.weight(1f),
             )
         }
@@ -1046,12 +1439,10 @@ private fun verdictColor(verdict: StyleStressLab.Verdict): Color = when (verdict
 }
 
 private fun stressSummary(report: StyleStressLab.Report): String {
-    val base = "В допуске ${report.passedCount} из ${report.cases.size} кейсов"
-    return if (report.peakWins > 0) {
-        "$base · пиковый сэмплер точнее в ${report.peakWins}"
-    } else {
-        base
-    }
+    val parts = mutableListOf("В допуске ${report.passedCount} из ${report.cases.size} кейсов")
+    if (report.adaptiveWins > 0) parts += "адаптивный точнее в ${report.adaptiveWins}"
+    if (report.peakWins > 0) parts += "пиковый точнее в ${report.peakWins}"
+    return parts.joinToString(" · ")
 }
 
 private fun kindDescription(kind: DocumentKind): String = when (kind) {

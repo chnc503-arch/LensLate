@@ -32,4 +32,49 @@ class OcrTextRepairTest {
     fun leavesOrdinaryCyrillicTextUntouched() {
         assertEquals("5-й квартал 2024 г.", OcrTextRepair.repair("5-й квартал 2024 г."))
     }
+
+    @Test
+    fun restoresDecorativeSeparatorFromSpacedApostrophe() {
+        assertEquals(
+            "акустика · свет · тишина",
+            OcrTextRepair.repair("акустика ' свет ' тишина"),
+        )
+        assertEquals(
+            "12 ОКТЯБРЯ · 20:00",
+            OcrTextRepair.repair("12 ОКТЯБРЯ ‘ 20:00"),
+        )
+    }
+
+    @Test
+    fun keepsQuotedWordsIntact() {
+        assertEquals("слово 'цитата' внутри", OcrTextRepair.repair("слово 'цитата' внутри"))
+    }
+
+    @Test
+    fun trimsOcrNoiseAroundDisplayLines() {
+        assertEquals("ЧЕМНОТЩ", OcrTextRepair.repair("___./ЧЕМНОТЩ"))
+        assertEquals("ОДИН ВЕЧЕР ОДНА СЦЕН", OcrTextRepair.repair("ОДИН ВЕЧЕР ОДНА СЦЕН ^"))
+    }
+
+    @Test
+    fun restoresMiddleDotFromSpacedHyphenInDisplayCaps() {
+        assertEquals("12 ОКТЯБРЯ · 20:00", OcrTextRepair.repair("12 ОКТЯБРЯ - 20:00"))
+        assertEquals("ТИХИЙ БАР · СТОЙКА 3", OcrTextRepair.repair("ТИХИЙ БАР - СТОЙКА 3"))
+    }
+
+    @Test
+    fun keepsDashInLowercaseProse() {
+        assertEquals(
+            "после концерта — открытый микрофон",
+            OcrTextRepair.repair("после концерта — открытый микрофон"),
+        )
+    }
+
+    @Test
+    fun joinsSlashGluedToSentenceEnd() {
+        assertEquals(
+            "нескольких УРОВНЯХ ЯРКОСТИ. Проверка идёт по всей строке:",
+            OcrTextRepair.repair("нескольких  УРОВНЯХ  ЯРКОСТИ ./Проверка идёт по всей строке:"),
+        )
+    }
 }

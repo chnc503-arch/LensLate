@@ -4,16 +4,19 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 /**
- * Synthetic hard cases for overlay colour quality: a blurry photo, an
- * overexposed highlight, low contrast and a textured colour gradient.
+ * Synthetic hard cases for overlay colour quality: a textured gradient, a
+ * blurry photo, two kinds of overexposure, low contrast and near-black ink on
+ * a dark surface.
  *
  * Each case is generated pixel by pixel with a known ink colour, then sampled
- * with the same [InkColorSampler] the app uses. The report compares three
+ * with the same [InkColorSampler] the app uses. The report compares four
  * strategies on identical pixels:
  *
  * - `global` — one background colour for the whole page (the old behaviour);
  * - `local` — per-glyph backdrop ramp, median of strong pixels (production);
- * - `peak` — local backdrop, mean of the most-covered quartile (experimental).
+ * - `peak` — local backdrop, mean of the most-covered quartile (experimental);
+ * - `adaptive` — LOCAL for glyphs with a solid core, PEAK for faint ink only
+ *   (candidate for the scan path).
  *
  * Pure Kotlin on purpose: the lab screen on a phone and the JVM tests run the
  * exact same generator and measurements.
@@ -28,17 +31,23 @@ object StyleStressLab {
         val globalError: Float,
         val localError: Float,
         val peakError: Float,
+        val adaptiveError: Float,
     ) {
         internal val best: InkColorSampler.Mode
-            get() = if (peakError < localError) InkColorSampler.Mode.PEAK else InkColorSampler.Mode.LOCAL
+            get() = when {
+                adaptiveError <= localError && adaptiveError <= peakError -> InkColorSampler.Mode.ADAPTIVE
+                peakError < localError -> InkColorSampler.Mode.PEAK
+                else -> InkColorSampler.Mode.LOCAL
+            }
 
         val passed: Boolean
-            get() = peakError <= PASS_ERROR && peakError <= localError + PASS_MARGIN
+            get() = adaptiveError <= PASS_ERROR && adaptiveError <= localError + PASS_MARGIN
     }
 
     data class Report(val cases: List<CaseResult>) {
         val passedCount: Int get() = cases.count { it.passed }
         val peakWins: Int get() = cases.count { it.peakError < it.localError }
+        val adaptiveWins: Int get() = cases.count { it.adaptiveError < it.localError }
 
         val verdict: Verdict
             get() = when {
@@ -85,6 +94,24 @@ object StyleStressLab {
                 overexposure = false,
                 lowContrast = true,
             ),
+            measure(
+                id = "dark-ink",
+                title = "Очень тёмный текст",
+                detail = "Почти чёрные чернила на тёмной текстуре: контраст ниже порога медианного сэмплера.",
+                blurRadius = 1,
+                overexposure = false,
+                lowContrast = false,
+                palette = Palette.DARK,
+            ),
+            measure(
+                id = "blown-out",
+                title = "Выжженный пересвет",
+                detail = "Блик силой 94% выжигает середину строки почти до белого.",
+                blurRadius = 1,
+                overexposure = true,
+                lowContrast = false,
+                glareStrength = BLOWN_GLARE_STRENGTH,
+            ),
         ),
     )
 
@@ -95,19 +122,24 @@ object StyleStressLab {
         blurRadius: Int,
         overexposure: Boolean,
         lowContrast: Boolean,
+        palette: Palette = Palette.STANDARD,
+        glareStrength: Float = GLARE_STRENGTH,
     ): CaseResult {
-        val page = buildPage(blurRadius, overexposure, lowContrast)
+        val page = buildPage(blurRadius, overexposure, lowContrast, palette, glareStrength)
         var globalSum = 0f
         var localSum = 0f
         var peakSum = 0f
+        var adaptiveSum = 0f
         page.glyphs.forEachIndexed { index, glyph ->
             val expected = page.expected[index]
             val global = sample(page, glyph, page.nominalInk, globalBackdrop = true)
             val local = sample(page, glyph, page.nominalInk, globalBackdrop = false)
             val peak = sample(page, glyph, page.nominalInk, globalBackdrop = false, mode = InkColorSampler.Mode.PEAK)
+            val adaptive = sample(page, glyph, page.nominalInk, globalBackdrop = false, mode = InkColorSampler.Mode.ADAPTIVE)
             globalSum += InkColorSampler.colorDistance(global, expected)
             localSum += InkColorSampler.colorDistance(local, expected)
             peakSum += InkColorSampler.colorDistance(peak, expected)
+            adaptiveSum += InkColorSampler.colorDistance(adaptive, expected)
         }
         val count = page.glyphs.size.coerceAtLeast(1)
         return CaseResult(
@@ -118,6 +150,7 @@ object StyleStressLab {
             globalError = globalSum / count,
             localError = localSum / count,
             peakError = peakSum / count,
+            adaptiveError = adaptiveSum / count,
         )
     }
 
@@ -162,8 +195,16 @@ object StyleStressLab {
         )
     }
 
-    private fun buildPage(blurRadius: Int, overexposure: Boolean, lowContrast: Boolean): Page {
+    private fun buildPage(
+        blurRadius: Int,
+        overexposure: Boolean,
+        lowContrast: Boolean,
+        palette: Palette,
+        glareStrength: Float,
+    ): Page {
         val pixels = IntArray(PAGE_WIDTH * PAGE_HEIGHT)
+        val backgroundStart = palette.backgroundStart
+        val backgroundEnd = palette.backgroundEnd
         for (y in 0 until PAGE_HEIGHT) {
             for (x in 0 until PAGE_WIDTH) {
                 val t = x.toFloat() / (PAGE_WIDTH - 1)
@@ -171,9 +212,12 @@ object StyleStressLab {
                 val grain = grain(x, y)
                 pixels[y * PAGE_WIDTH + x] = argb(
                     255,
-                    (26 + 128 * t + stripe + grain).toInt().coerceIn(0, 255),
-                    (34 + 44 * t + stripe / 2 + grain).toInt().coerceIn(0, 255),
-                    (92 - 54 * t + grain).toInt().coerceIn(0, 255),
+                    (red(backgroundStart) + (red(backgroundEnd) - red(backgroundStart)) * t + stripe + grain)
+                        .toInt().coerceIn(0, 255),
+                    (green(backgroundStart) + (green(backgroundEnd) - green(backgroundStart)) * t + stripe / 2 + grain)
+                        .toInt().coerceIn(0, 255),
+                    (blue(backgroundStart) + (blue(backgroundEnd) - blue(backgroundStart)) * t + grain)
+                        .toInt().coerceIn(0, 255),
                 )
             }
         }
@@ -187,7 +231,7 @@ object StyleStressLab {
         val inkColors = glyphs.map { glyph ->
             val center = (glyph.left + glyph.right) / 2
             val fraction = (center - firstCenter).toFloat() / (lastCenter - firstCenter)
-            StyleGradient.lerpColor(WARM_INK, COLD_INK, fraction)
+            StyleGradient.lerpColor(palette.inkStart, palette.inkEnd, fraction)
         }
         val expected = IntArray(glyphs.size)
         glyphs.forEachIndexed { index, glyph ->
@@ -201,7 +245,7 @@ object StyleStressLab {
                 ink
             }
             expected[index] = if (overexposure) {
-                StyleGradient.lerpColor(drawn, WHITE, glareWeight(centerX, centerY))
+                StyleGradient.lerpColor(drawn, WHITE, glareWeight(centerX, centerY, glareStrength))
             } else {
                 drawn
             }
@@ -218,7 +262,7 @@ object StyleStressLab {
         if (overexposure) {
             for (y in 0 until PAGE_HEIGHT) {
                 for (x in 0 until PAGE_WIDTH) {
-                    val weight = glareWeight(x, y)
+                    val weight = glareWeight(x, y, glareStrength)
                     if (weight <= 0f) continue
                     val index = y * PAGE_WIDTH + x
                     pixels[index] = StyleGradient.lerpColor(pixels[index], WHITE, weight)
@@ -234,7 +278,7 @@ object StyleStressLab {
             glyphs = glyphs,
             expected = expected,
             globalBackground = blurred[GLOBAL_SAMPLE_ROW * PAGE_WIDTH + GLOBAL_SAMPLE_COLUMN],
-            nominalInk = StyleGradient.lerpColor(WARM_INK, COLD_INK, 0.5f),
+            nominalInk = StyleGradient.lerpColor(palette.inkStart, palette.inkEnd, 0.5f),
         )
     }
 
@@ -291,19 +335,39 @@ object StyleStressLab {
         return vertical
     }
 
-    private fun glareWeight(x: Int, y: Int): Float {
+    private fun glareWeight(x: Int, y: Int, strength: Float): Float {
         val dx = (x - GLARE_X) / GLARE_RADIUS_X
         val dy = (y - GLARE_Y) / GLARE_RADIUS_Y
         val distance = dx * dx + dy * dy
         if (distance >= 1f) return 0f
         val falloff = 1f - distance
-        return falloff * falloff * GLARE_STRENGTH
+        return falloff * falloff * strength
     }
 
     private fun grain(x: Int, y: Int): Int {
         var hash = x * 374761393 + y * 668265263
         hash = (hash xor (hash shr 13)) * 1274126177
         return ((hash xor (hash shr 16)) and 0xF) - 7
+    }
+
+    private enum class Palette(
+        val backgroundStart: Int,
+        val backgroundEnd: Int,
+        val inkStart: Int,
+        val inkEnd: Int,
+    ) {
+        STANDARD(
+            backgroundStart = 0xFF1A225C.toInt(),
+            backgroundEnd = 0xFF9A4E26.toInt(),
+            inkStart = 0xFFEB283C.toInt(),
+            inkEnd = 0xFF2855FF.toInt(),
+        ),
+        DARK(
+            backgroundStart = 0xFF0C0C10.toInt(),
+            backgroundEnd = 0xFF2A2018.toInt(),
+            inkStart = 0xFF3A0410.toInt(),
+            inkEnd = 0xFF001C3A.toInt(),
+        ),
     }
 
     private data class GlyphBox(val left: Int, val top: Int, val right: Int, val bottom: Int)
@@ -342,11 +406,10 @@ object StyleStressLab {
     private const val GLARE_RADIUS_X = 150f
     private const val GLARE_RADIUS_Y = 74f
     private const val GLARE_STRENGTH = 0.62f
+    private const val BLOWN_GLARE_STRENGTH = 0.94f
     private const val GLOBAL_SAMPLE_ROW = 3
     private const val GLOBAL_SAMPLE_COLUMN = 3
     private const val PASS_ERROR = 0.08f
     private const val PASS_MARGIN = 0.02f
     private const val WHITE = 0xFFFFFFFF.toInt()
-    private val WARM_INK = 0xFFEB283C.toInt()
-    private val COLD_INK = 0xFF2855FF.toInt()
 }

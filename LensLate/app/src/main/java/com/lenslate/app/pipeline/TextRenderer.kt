@@ -87,6 +87,10 @@ class TextRenderer @Inject constructor() {
                 ?: FontCatalog.fallbackKey(fontClass, weight, weight >= 600),
             fontMatchScore = appearance?.fontMatchScore ?: 0f,
             linePitchPx = sourceLinePitch(region),
+            shadowColor = appearance?.shadowColor ?: 0,
+            shadowRadiusPx = appearance?.shadowRadiusPx ?: 0f,
+            shadowOffsetX = appearance?.shadowOffsetX ?: 0f,
+            shadowOffsetY = appearance?.shadowOffsetY ?: 0f,
         )
     }
 
@@ -815,6 +819,16 @@ class TextRenderer @Inject constructor() {
             paint.strokeJoin = Paint.Join.ROUND
             paint.strokeCap = Paint.Cap.ROUND
         }
+        if (style.shadowRadiusPx > MIN_SHADOW_RADIUS &&
+            Color.alpha(style.shadowColor) > MIN_SHADOW_ALPHA
+        ) {
+            paint.setShadowLayer(
+                style.shadowRadiusPx,
+                style.shadowOffsetX,
+                style.shadowOffsetY,
+                style.shadowColor,
+            )
+        }
         return paint
     }
 
@@ -1020,6 +1034,8 @@ class TextRenderer @Inject constructor() {
         const val MAX_ACCENT_PREFIX_SHARE = 0.2f
         const val MIN_ACCENT_DISPARITY = 140
         const val MAX_ACCENT_RUN_DISPARITY = 90
+        const val MIN_SHADOW_RADIUS = 0.5f
+        const val MIN_SHADOW_ALPHA = 8
         const val MIN_ACCENT_BODY_SHARE = 0.6f
         const val MIN_ROTATION_DEGREES = 0.75f
         const val FIT_ITERATIONS = 10

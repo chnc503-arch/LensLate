@@ -17,6 +17,7 @@ class OcrRegionMergerTest {
         top: Float,
         right: Float,
         bottom: Float,
+        confidence: Float? = null,
     ): TextRegionRecord {
         val polygon = listOf(
             Point2D(left, top),
@@ -31,8 +32,8 @@ class OcrRegionMergerTest {
             polygon = polygon,
             script = "Latin",
             readingOrder = id - 1,
-            confidence = null,
-            overallConfidence = null,
+            confidence = confidence,
+            overallConfidence = confidence,
             lines = emptyList(),
         )
     }
@@ -74,5 +75,82 @@ class OcrRegionMergerTest {
         val result = OcrRegionMerger().merge(listOf(a, b))
         assertEquals(1, result.regions.size)
         assertEquals("2024 год", result.regions[0].text)
+    }
+
+    @Test
+    fun consensusKeepsCompleteTitleEvenWhenFragmentHasHigherConfidence() {
+        val full = (1..6).map { index ->
+            candidate(
+                "pass-$index",
+                0.86f,
+                region(index, "ТЁМНЫЙ ЗАЛ", 78f, 75f, 927f, 176f, confidence = 0.885f),
+            )
+        }
+        val truncated = candidate(
+            "auto-document",
+            0.76f,
+            region(20, "ТЁМНЫЙ", 78f, 74f, 656f, 175f, confidence = 0.899f),
+        )
+        val result = OcrRegionMerger().merge(full + truncated, consensusReadings = true)
+        assertEquals(1, result.regions.size)
+        assertEquals("ТЁМНЫЙ ЗАЛ", result.regions[0].text)
+    }
+
+    @Test
+    fun consensusPrefersRealWordOverInventedAcronym() {
+        val acronym = (1..3).map { index ->
+            candidate(
+                "pass-$index",
+                0.85f,
+                region(index, "вход строго ПО СПЦСКЭМ", 85f, 371f, 395f, 396f, confidence = 0.84f),
+            )
+        }
+        val word = (4..5).map { index ->
+            candidate(
+                "pass-$index",
+                0.85f,
+                region(index, "вход строго по спискам", 85f, 371f, 395f, 396f, confidence = 0.81f),
+            )
+        }
+        val result = OcrRegionMerger().merge(acronym + word, consensusReadings = true)
+        assertEquals(1, result.regions.size)
+        assertEquals("вход строго по спискам", result.regions[0].text)
+    }
+
+    @Test
+    fun consensusPrefersWordOverLongNumberInSameLine() {
+        val word = (1..4).map { index ->
+            candidate(
+                "pass-$index",
+                0.86f,
+                region(
+                    index,
+                    "акустика ' свет ' тишина",
+                    85f,
+                    238f,
+                    587f,
+                    266f,
+                    confidence = 0.85f,
+                ),
+            )
+        }
+        val digits = (5..6).map { index ->
+            candidate(
+                "pass-$index",
+                0.87f,
+                region(
+                    index,
+                    "акустика ' 088771 ' тишина",
+                    85f,
+                    238f,
+                    587f,
+                    266f,
+                    confidence = 0.833f,
+                ),
+            )
+        }
+        val result = OcrRegionMerger().merge(word + digits, consensusReadings = true)
+        assertEquals(1, result.regions.size)
+        assertEquals("акустика ' свет ' тишина", result.regions[0].text)
     }
 }

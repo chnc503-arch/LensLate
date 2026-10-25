@@ -34,6 +34,7 @@ internal enum class PreprocessOperation {
     TOPOHAT,
     DENOISE_SHARPEN,
     FLAT_FIELD,
+    LOCAL_NORMALIZE,
     UPSCALE,
 }
 
@@ -343,6 +344,7 @@ internal class OcrPreprocessor {
             PreprocessOperation.DENOISE_SHARPEN ->
                 denoiseSharpenPixels(pixels, width, height, stage.denoiseStrength, stage.sharpness)
             PreprocessOperation.FLAT_FIELD -> flatFieldPixels(pixels, width, height)
+            PreprocessOperation.LOCAL_NORMALIZE -> localNormalizePixels(pixels, width, height)
         }
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).apply {
             setPixels(output, 0, width, 0, 0, width, height)
@@ -443,6 +445,34 @@ internal class OcrPreprocessor {
                 PreprocessStage(PreprocessOperation.UNSHARP_MASK, sharpness = 0.8f),
             )
         }
+        // Mixed posters carry both dark-on-light and light-on-dark blocks, and a
+        // white-on-white card hides in the highlights. Each polarity and each
+        // faint-ink direction gets its own pass; consensus later keeps the
+        // reading that is supported by real glyphs.
+        if (dark || glare || uneven || veryLowContrast) {
+            recipes += recipe(
+                name = "auto-invert",
+                description = "инверсия полярности + локальный контраст + резкость",
+                PreprocessStage(PreprocessOperation.INVERT),
+                PreprocessStage(PreprocessOperation.CLAHE, threshold = 3.0f),
+                PreprocessStage(PreprocessOperation.UNSHARP_MASK, sharpness = 0.5f),
+            )
+            recipes += recipe(
+                name = "auto-faint",
+                description = "локальная нормализация тёмных чернил + резкость",
+                PreprocessStage(PreprocessOperation.LOCAL_NORMALIZE),
+                PreprocessStage(PreprocessOperation.CLAHE, threshold = 2.6f),
+                PreprocessStage(PreprocessOperation.UNSHARP_MASK, sharpness = 0.65f),
+            )
+            recipes += recipe(
+                name = "auto-faint-invert",
+                description = "локальная нормализация светлых чернил + инверсия",
+                PreprocessStage(PreprocessOperation.LOCAL_NORMALIZE),
+                PreprocessStage(PreprocessOperation.INVERT),
+                PreprocessStage(PreprocessOperation.CLAHE, threshold = 2.4f),
+                PreprocessStage(PreprocessOperation.UNSHARP_MASK, sharpness = 0.6f),
+            )
+        }
         if ((lowContrast && soft) || uneven) {
             val k = if (veryLowContrast) 0.26f else SAUVOLA_K
             recipes += recipe(
@@ -477,6 +507,18 @@ internal class OcrPreprocessor {
                 PreprocessStage(PreprocessOperation.GRAYSCALE_STRETCH),
                 PreprocessStage(PreprocessOperation.TOPOHAT),
                 PreprocessStage(PreprocessOperation.UNSHARP_MASK, sharpness = 0.5f),
+            )
+        }
+        if (uneven || soft) {
+            // Faint lettering keeps all its detail in a narrow local band: a
+            // strong CLAHE pass recovers it even when the page as a whole has a
+            // wide tonal range.
+            recipes += recipe(
+                name = "auto-local-contrast",
+                description = "серое ядро + сильный локальный контраст + резкость",
+                PreprocessStage(PreprocessOperation.GRAYSCALE_STRETCH),
+                PreprocessStage(PreprocessOperation.CLAHE, threshold = 3.8f),
+                PreprocessStage(PreprocessOperation.UNSHARP_MASK, sharpness = 0.75f),
             )
         }
         val upscale = upscaleFactor(stats, aggressive = false)
@@ -676,10 +718,18 @@ internal class OcrPreprocessor {
         (source[index] and 0xFF000000.toInt()) or (value shl 16) or (value shl 8) or value
     }
 
-    /** Normalizes dark-background photographs so local filters always see dark glyphs on light paper. */
+    /**
+     * Inverts only frames that are dark almost everywhere (light lettering on a
+     * night scene). Mixed pages such as a cream poster above a dark card carry
+     * both polarities, so a global inversion would destroy one half of the text.
+     */
     private fun lightBackgroundLuma(luma: IntArray): IntArray {
-        val sum = luma.sumOf { it.toLong() }
-        if (sum * 2 >= luma.size.toLong() * 255L) return luma
+        var light = 0
+        for (value in luma) if (value > BRIGHT_AREA_LUMA) light++
+        if (light * 100 >= luma.size * MIN_BRIGHT_AREA_PERCENT) return luma
+        var dark = 0
+        for (value in luma) if (value < DARK_AREA_LUMA) dark++
+        if (dark * 100 < luma.size * MIN_DARK_AREA_PERCENT) return luma
         return IntArray(luma.size) { 255 - luma[it] }
     }
 
@@ -1037,6 +1087,113 @@ internal class OcrPreprocessor {
     }
 
     /** Removes uneven illumination by dividing the image by a heavily smoothed paper estimate. */
+    /**
+     * Stretches each neighbourhood between its own darkest and lightest pixels.
+     * A white glyph on cream or a grey glyph on near-black then reaches the
+     * full 0..255 range, so Tesseract sees the shapes instead of a flat field.
+     */
+    private fun localNormalizePixels(pixels: IntArray, width: Int, height: Int): IntArray {
+        val luma = lumaArray(pixels)
+        val scale = min(1f, LOCAL_NORMALIZE_PREVIEW / max(width, height).toFloat())
+        val smallWidth = max(8, (width * scale).roundToInt())
+        val smallHeight = max(8, (height * scale).roundToInt())
+        val small = IntArray(smallWidth * smallHeight) { index ->
+            val x = (index % smallWidth) * width / smallWidth
+            val y = (index / smallWidth) * height / smallHeight
+            luma[y * width + x]
+        }
+        val low = rankFilter(small, smallWidth, smallHeight, LOCAL_NORMALIZE_RADIUS, takeMax = false)
+        val high = rankFilter(small, smallWidth, smallHeight, LOCAL_NORMALIZE_RADIUS, takeMax = true)
+        val xBase = IntArray(width)
+        val xNext = IntArray(width)
+        val xFraction = FloatArray(width)
+        for (x in 0 until width) {
+            val position = (x.toFloat() / width * (smallWidth - 1)).coerceIn(0f, (smallWidth - 1).toFloat())
+            xBase[x] = position.toInt()
+            xNext[x] = min(smallWidth - 1, xBase[x] + 1)
+            xFraction[x] = position - xBase[x]
+        }
+        val output = IntArray(luma.size)
+        for (y in 0 until height) {
+            val position = (y.toFloat() / height * (smallHeight - 1)).coerceIn(0f, (smallHeight - 1).toFloat())
+            val baseY = position.toInt()
+            val nextY = min(smallHeight - 1, baseY + 1)
+            val fractionY = position - baseY
+            val baseOffset = baseY * smallWidth
+            val nextOffset = nextY * smallWidth
+            for (x in 0 until width) {
+                val baseX = xBase[x]
+                val nextX = xNext[x]
+                val fractionX = xFraction[x]
+                val lowValue = interpolate(
+                    low[baseOffset + baseX],
+                    low[baseOffset + nextX],
+                    low[nextOffset + baseX],
+                    low[nextOffset + nextX],
+                    fractionX,
+                    fractionY,
+                )
+                val highValue = interpolate(
+                    high[baseOffset + baseX],
+                    high[baseOffset + nextX],
+                    high[nextOffset + baseX],
+                    high[nextOffset + nextX],
+                    fractionX,
+                    fractionY,
+                )
+                val span = (highValue - lowValue).coerceAtLeast(LOCAL_NORMALIZE_MIN_SPAN)
+                output[y * width + x] = ((luma[y * width + x] - lowValue) * 255f / span)
+                    .roundToInt()
+                    .coerceIn(0, 255)
+            }
+        }
+        return grayOutput(output, pixels)
+    }
+
+    private fun interpolate(a: Int, b: Int, c: Int, d: Int, fractionX: Float, fractionY: Float): Float {
+        val top = a + (b - a) * fractionX
+        val bottom = c + (d - c) * fractionX
+        return top + (bottom - top) * fractionY
+    }
+
+    /** Variants for re-reading a single glyph block after the page-level passes. */
+    fun planRefinement(bitmap: Bitmap): PreprocessingPlan {
+        val stats = analyzeImage(bitmap)
+        val variants = listOf(
+            OcrVariantSpec("refine-original", PreprocessOperation.ORIGINAL),
+            recipe(
+                name = "refine-clahe",
+                description = "локальный контраст + резкость",
+                PreprocessStage(PreprocessOperation.CLAHE, threshold = 2.4f),
+                PreprocessStage(PreprocessOperation.UNSHARP_MASK, sharpness = 0.6f),
+            ),
+            recipe(
+                name = "refine-invert",
+                description = "инверсия + локальный контраст",
+                PreprocessStage(PreprocessOperation.INVERT),
+                PreprocessStage(PreprocessOperation.CLAHE, threshold = 2.6f),
+                PreprocessStage(PreprocessOperation.UNSHARP_MASK, sharpness = 0.5f),
+            ),
+            recipe(
+                name = "refine-faint",
+                description = "локальная нормализация + резкость",
+                PreprocessStage(PreprocessOperation.LOCAL_NORMALIZE),
+                PreprocessStage(PreprocessOperation.CLAHE, threshold = 2.4f),
+                PreprocessStage(PreprocessOperation.UNSHARP_MASK, sharpness = 0.6f),
+            ),
+            recipe(
+                name = "refine-faint-invert",
+                description = "локальная нормализация светлых чернил + инверсия",
+                PreprocessStage(PreprocessOperation.LOCAL_NORMALIZE),
+                PreprocessStage(PreprocessOperation.INVERT),
+                PreprocessStage(PreprocessOperation.CLAHE, threshold = 2.2f),
+                PreprocessStage(PreprocessOperation.UNSHARP_MASK, sharpness = 0.55f),
+            ),
+            OcrVariantSpec("refine-gray", PreprocessOperation.GRAYSCALE_STRETCH),
+        )
+        return PreprocessingPlan(stats.quality, variants, stats.lowPercentile, stats.highPercentile)
+    }
+
     private fun flatFieldPixels(pixels: IntArray, width: Int, height: Int): IntArray {
         val luma = lightBackgroundLuma(lumaArray(pixels))
         val scale = min(1f, FLAT_FIELD_PREVIEW / max(width, height).toFloat())
@@ -1302,8 +1459,8 @@ internal class OcrPreprocessor {
 
     private companion object {
         const val MAX_SAMPLE_DIMENSION = 384
-        const val MAX_AUTO_RECIPES = 8
-        const val MAX_VARIANTS = 12
+        const val MAX_AUTO_RECIPES = 11
+        const val MAX_VARIANTS = 16
         const val MAX_ROTATION_VARIANTS = 2
         const val LOW_PERCENTILE = 0.05f
         const val HIGH_PERCENTILE = 0.95f
@@ -1320,6 +1477,13 @@ internal class OcrPreprocessor {
         const val COLOR_DIFFERENCE_THRESHOLD = 24
         const val DARK_MEAN_THRESHOLD = 0.34f
         const val BRIGHT_MEAN_THRESHOLD = 0.76f
+        const val BRIGHT_AREA_LUMA = 160
+        const val DARK_AREA_LUMA = 96
+        const val MIN_BRIGHT_AREA_PERCENT = 12
+        const val MIN_DARK_AREA_PERCENT = 80
+        const val LOCAL_NORMALIZE_PREVIEW = 384f
+        const val LOCAL_NORMALIZE_RADIUS = 4
+        const val LOCAL_NORMALIZE_MIN_SPAN = 12f
         const val ORIENTATION_PREVIEW_DIMENSION = 256f
         const val MAX_ORIENTATION_PIXELS = 40_000
         const val MAX_ORIENTATION_POINTS = 30_000

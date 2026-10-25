@@ -1,6 +1,7 @@
 package com.lenslate.app.ui
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -9,6 +10,7 @@ import android.graphics.RectF
 import android.net.Uri
 import android.os.SystemClock
 import android.provider.OpenableColumns
+import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -27,6 +29,8 @@ import com.lenslate.app.pipeline.LanguageDetector
 import com.lenslate.app.pipeline.OcrEngineChoice
 import com.lenslate.app.pipeline.OcrExperimentResult
 import com.lenslate.app.pipeline.OcrProcessor
+import com.lenslate.app.pipeline.ScanTranslationPolicy
+import com.lenslate.app.pipeline.SmartScanQuality
 import com.lenslate.app.pipeline.StyleStressLab
 import com.lenslate.app.pipeline.TextRenderer
 import com.lenslate.app.pipeline.TranslationEngine
@@ -39,6 +43,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import kotlin.math.roundToInt
@@ -53,6 +58,30 @@ data class ToastMessage(val id: Long, val text: String)
 data class AppliedExperiment(
     val engine: OcrEngineChoice,
     val variantName: String,
+)
+
+/** One measured step of the automated smart-scan preview. */
+data class SmartLabStage(
+    val title: String,
+    val detail: String,
+    val durationMs: Long,
+)
+
+/**
+ * Fully automatic lab result: OCR hypothesis chosen without a human, translated,
+ * background-restored and rendered exactly like the regular scan would.
+ */
+data class SmartLabResult(
+    val original: Bitmap,
+    val rendered: Bitmap,
+    val document: ScanDocument,
+    val stages: List<SmartLabStage>,
+    val translated: Int,
+    val total: Int,
+    val totalMs: Long,
+    val fastScore: Float,
+    val chosenScore: Float,
+    val deepPassUsed: Boolean,
 )
 
 data class ScanUiState(
@@ -76,6 +105,9 @@ data class ScanUiState(
     val labResults: List<OcrExperimentResult> = emptyList(),
     val labPreview: Bitmap? = null,
     val labPreviewName: String? = null,
+    val labPages: List<String> = emptyList(),
+    val smartRunning: Boolean = false,
+    val smartResult: SmartLabResult? = null,
     val appliedExperiment: AppliedExperiment? = null,
     /** Synthetic overlay-quality stress report; independent of the current photo. */
     val styleStress: StyleStressLab.Report? = null,
@@ -86,7 +118,8 @@ data class ScanUiState(
     val aggressiveSanitizer: Boolean = false,
 ) {
     val isBusy: Boolean
-        get() = phase == ScanPhase.LOADING || phase == ScanPhase.PROCESSING || labRunning
+        get() = phase == ScanPhase.LOADING || phase == ScanPhase.PROCESSING ||
+            labRunning || smartRunning
     val hasImage: Boolean get() = original != null
     val hasTranslation: Boolean get() = rendered != null
     val regions get() = document?.regions.orEmpty()
@@ -114,6 +147,8 @@ class ScanViewModel @Inject constructor(
     private var loadJob: Job? = null
     private var modelsJob: Job? = null
     private var labJob: Job? = null
+    private var smartJob: Job? = null
+    private var lastLabPage: String? = null
     private var styleStressJob: Job? = null
     private val stateLock = Any()
     private val messageIds = AtomicLong()
@@ -123,9 +158,11 @@ class ScanViewModel @Inject constructor(
     }
 
     fun loadImage(uri: Uri) {
+        if (uri.scheme != "file") lastLabPage = null
         pipelineJob?.cancel()
         loadJob?.cancel()
         labJob?.cancel()
+        smartJob?.cancel()
         loadJob = viewModelScope.launch {
             mutate {
                 it.copy(
@@ -142,6 +179,8 @@ class ScanViewModel @Inject constructor(
                     labResults = emptyList(),
                     labPreview = null,
                     labPreviewName = null,
+                    smartRunning = false,
+                    smartResult = null,
                     appliedExperiment = null,
                 )
             }
@@ -177,6 +216,7 @@ class ScanViewModel @Inject constructor(
         pipelineJob?.cancel()
         loadJob?.cancel()
         labJob?.cancel()
+        smartJob?.cancel()
         mutate { current ->
             ScanUiState(
                 fromLanguage = current.fromLanguage,
@@ -499,15 +539,7 @@ class ScanViewModel @Inject constructor(
                 refreshModelPacks()
                 val pair = TranslationPair(from = effectiveSource, to = target)
                 val protectedCount = document.regions.count { it.isProtected }
-                val uncertainCount = document.regions.count { region ->
-                    region.text.isNotBlank() && !region.isFormula && !region.isProtected &&
-                        region.confidence != null && region.confidence < MIN_REPLACE_CONFIDENCE
-                }
-                val translatableIndices = document.regions.indices.filter { index ->
-                    val region = document.regions[index]
-                    region.text.isNotBlank() && !region.isFormula && !region.isProtected &&
-                        region.confidence?.let { it >= MIN_REPLACE_CONFIDENCE } != false
-                }
+                val translatableIndices = ScanTranslationPolicy.selectableIndices(document.regions)
                 if (translatableIndices.isEmpty()) {
                     mutate {
                         it.copy(
@@ -515,25 +547,17 @@ class ScanViewModel @Inject constructor(
                             document = document,
                             rendered = bitmap,
                             progress = it.progress.copy(
-                                translate = StepState.Done(
-                                    0,
-                                    when {
-                                        uncertainCount > 0 -> "Все блоки с низкой уверенностью"
-                                        else -> "Формулы, числа и изображения"
-                                    },
-                                ),
+                                translate = StepState.Done(0, "Формулы, числа и изображения"),
                                 inpaint = StepState.Done(0, "Пропущено"),
                                 render = StepState.Done(0, "Оставлено без изменений"),
                             ),
                         )
                     }
                     notify(
-                        when {
-                            uncertainCount > 0 ->
-                                "$uncertainCount блоков оставлено как в оригинале — низкая уверенность распознавания"
-                            protectedCount > 0 ->
-                                "Формулы и $protectedCount блоков внутри изображений сохранены как в оригинале"
-                            else -> "Формулы и числа сохранены как в оригинале"
+                        if (protectedCount > 0) {
+                            "Формулы и $protectedCount блоков внутри изображений сохранены как в оригинале"
+                        } else {
+                            "Формулы и числа сохранены как в оригинале"
                         },
                     )
                     return@launch
@@ -562,8 +586,13 @@ class ScanViewModel @Inject constructor(
                 val translations = HashMap<Int, String>()
                 outcomes.forEachIndexed { outcomeIndex, outcome ->
                     val text = outcome.text?.trim().orEmpty()
+                    val regionIndex = translatableIndices[outcomeIndex]
+                    android.util.Log.i(
+                        "LensLateTr",
+                        "src=${document.regions[regionIndex].text.replace('\n', '/')} -> ${text.replace('\n', '/')} err=${outcome.error}",
+                    )
                     if (text.isNotEmpty()) {
-                        translations[translatableIndices[outcomeIndex]] = text
+                        translations[regionIndex] = text
                     }
                 }
                 mutate { current ->
@@ -661,9 +690,6 @@ class ScanViewModel @Inject constructor(
                 val preservedSuffix = buildString {
                     if (preservedFormulas > 0) append(" · $preservedFormulas формул без изменений")
                     if (protectedCount > 0) append(" · $protectedCount блоков в изображениях сохранено")
-                    if (uncertainCount > 0) {
-                        append(" · $uncertainCount блоков оставлено (низкая уверенность)")
-                    }
                 }
                 notify(
                     if (failed > 0) {
@@ -730,6 +756,218 @@ class ScanViewModel @Inject constructor(
 
     fun clearLabPreview() {
         mutate { it.copy(labPreview = null, labPreviewName = null) }
+    }
+
+    fun refreshLabPages() {
+        viewModelScope.launch {
+            val pages = withContext(Dispatchers.IO) {
+                val dir = context.getExternalFilesDir(LAB_PAGES_DIR) ?: return@withContext emptyList()
+                dir.listFiles()
+                    .orEmpty()
+                    .filter { it.isFile && it.extension.lowercase() in LAB_PAGE_EXTENSIONS }
+                    .map { it.name }
+                    .sorted()
+            }
+            mutate { if (it.labPages == pages) it else it.copy(labPages = pages) }
+        }
+    }
+
+    fun loadLabPage(name: String) {
+        if (state.isBusy) return
+        val dir = context.getExternalFilesDir(LAB_PAGES_DIR) ?: return
+        val file = File(dir, name)
+        val safe = runCatching {
+            file.canonicalFile.parentFile == dir.canonicalFile && file.isFile
+        }.getOrDefault(false)
+        if (!safe) {
+            notify("Тестовая страница не найдена")
+            return
+        }
+        lastLabPage = name
+        loadImage(Uri.fromFile(file))
+    }
+
+    fun clearSmartResult() {
+        mutate { it.copy(smartResult = null) }
+    }
+
+    /**
+     * Lab prototype of the future smart stage: one tap runs the whole translation
+     * automatically, including a deeper retry when the first reading looks weak.
+     * It never touches the regular scan result.
+     */
+    fun runSmartLab() {
+        val snapshot = state
+        val bitmap = snapshot.original ?: return
+        if (snapshot.isBusy) return
+        val source = snapshot.fromLanguage ?: Language.RUSSIAN
+        val target = snapshot.toLanguage
+        if (source == target) {
+            notify("Исходный и целевой языки совпадают")
+            return
+        }
+        smartJob?.cancel()
+        smartJob = viewModelScope.launch {
+            mutate { it.copy(smartRunning = true, smartResult = null, error = null) }
+            val startedAt = SystemClock.elapsedRealtime()
+            val stages = mutableListOf<SmartLabStage>()
+            try {
+                val imageInfo = snapshot.imageInfo
+                    ?: ScanImageInfo.identity(bitmap.width, bitmap.height)
+                val imageArea = bitmap.width.toFloat() * bitmap.height.toFloat()
+
+                var stepStarted = SystemClock.elapsedRealtime()
+                var document = withContext(Dispatchers.Default) {
+                    ocrProcessor.processDetailed(
+                        bitmap = bitmap,
+                        imageInfo = imageInfo,
+                        useJapanese = false,
+                        useCyrillic = false,
+                        experimentMode = false,
+                        scanMode = ScanMode.EXTENDED,
+                        autoDetect = true,
+                        protectEmbeddedImages = snapshot.protectEmbeddedImages,
+                        aggressiveSanitizer = snapshot.aggressiveSanitizer,
+                        lexicalRepair = true,
+                    )
+                }
+                var fastScore = SmartScanQuality.score(document.regions, imageArea, lexical = true)
+                var chosenScore = fastScore
+                stages += SmartLabStage(
+                    title = "Быстрый проход",
+                    detail = "${document.regions.size} блоков · ${ocrEngineLabel(document)} · " +
+                        "качество ${(fastScore * 100f).roundToInt()}%",
+                    durationMs = SystemClock.elapsedRealtime() - stepStarted,
+                )
+
+                var deepPassUsed = false
+                if (SmartScanQuality.needsDeeperPass(fastScore, document.regions, lexical = true)) {
+                    deepPassUsed = true
+                    stepStarted = SystemClock.elapsedRealtime()
+                    val deepDocument = try {
+                        withContext(Dispatchers.Default) {
+                            ocrProcessor.processDetailed(
+                                bitmap = bitmap,
+                                imageInfo = imageInfo,
+                                useJapanese = false,
+                                useCyrillic = true,
+                                experimentMode = true,
+                                scanMode = ScanMode.EXTENDED,
+                                maxCyrillicPasses = SMART_DEEP_PASSES,
+                                protectEmbeddedImages = snapshot.protectEmbeddedImages,
+                                aggressiveSanitizer = snapshot.aggressiveSanitizer,
+                                lexicalRepair = true,
+                            )
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        null
+                    }
+                    val deepScore = deepDocument
+                        ?.let { SmartScanQuality.score(it.regions, imageArea, lexical = true) }
+                        ?: 0f
+                    stages += SmartLabStage(
+                        title = "Глубокий проход",
+                        detail = deepDocument?.let {
+                            "${it.regions.size} блоков · ${ocrEngineLabel(it)} · " +
+                                "качество ${(deepScore * 100f).roundToInt()}%"
+                        } ?: "не удалось, оставляем быстрый проход",
+                        durationMs = SystemClock.elapsedRealtime() - stepStarted,
+                    )
+                    if (deepDocument != null && deepScore > fastScore) {
+                        document = deepDocument
+                        chosenScore = deepScore
+                    }
+                }
+
+                if (document.regions.isEmpty()) {
+                    mutate { it.copy(smartRunning = false) }
+                    notify("Умный скан не нашёл текст")
+                    return@launch
+                }
+
+                stepStarted = SystemClock.elapsedRealtime()
+                val translatable = ScanTranslationPolicy.selectableIndices(document.regions)
+                val outcomes = withContext(Dispatchers.Default) {
+                    translationEngine.translateBatch(
+                        texts = translatable.map { document.regions[it].text },
+                        pair = TranslationPair(from = source, to = target),
+                        onModelDownload = {},
+                    )
+                }
+                val translations = HashMap<Int, String>()
+                outcomes.forEachIndexed { index, outcome ->
+                    val text = outcome.text?.trim().orEmpty()
+                    if (text.isNotEmpty()) translations[translatable[index]] = text
+                }
+                val translatedDocument = document.copy(
+                    regions = document.regions.mapIndexed { index, region ->
+                        val translation = translations[index] ?: return@mapIndexed region
+                        region.copy(
+                            translation = translation,
+                            translationConfidence = region.confidence,
+                        )
+                    },
+                )
+                stages += SmartLabStage(
+                    title = "Перевод",
+                    detail = "${translations.size} из ${translatable.size} блоков",
+                    durationMs = SystemClock.elapsedRealtime() - stepStarted,
+                )
+
+                stepStarted = SystemClock.elapsedRealtime()
+                val replaceable = translatedDocument.regions.filter { region ->
+                    !region.isProtected &&
+                        !region.translation.isNullOrBlank() &&
+                        region.translation != region.text
+                }
+                val restored = withContext(Dispatchers.Default) {
+                    if (replaceable.isEmpty()) bitmap
+                    else backgroundRestorer.restore(bitmap, replaceable)
+                }
+                stages += SmartLabStage(
+                    title = "Восстановление фона",
+                    detail = if (replaceable.isEmpty()) "нечего удалять" else "${replaceable.size} блоков",
+                    durationMs = SystemClock.elapsedRealtime() - stepStarted,
+                )
+
+                stepStarted = SystemClock.elapsedRealtime()
+                val rendered = withContext(Dispatchers.Default) {
+                    if (replaceable.isEmpty()) bitmap
+                    else textRenderer.render(restored, replaceable, translatedDocument.regions)
+                }
+                stages += SmartLabStage(
+                    title = "Отрисовка",
+                    detail = if (replaceable.isEmpty()) "без изменений" else "готова",
+                    durationMs = SystemClock.elapsedRealtime() - stepStarted,
+                )
+                if (isDebuggableBuild()) {
+                    debugSmartRun(translatedDocument, rendered, stages, lastLabPage)
+                }
+
+                val result = SmartLabResult(
+                    original = bitmap,
+                    rendered = rendered,
+                    document = translatedDocument,
+                    stages = stages,
+                    translated = translations.size,
+                    total = document.regions.size,
+                    totalMs = SystemClock.elapsedRealtime() - startedAt,
+                    fastScore = fastScore,
+                    chosenScore = chosenScore,
+                    deepPassUsed = deepPassUsed,
+                )
+                mutate { it.copy(smartRunning = false, smartResult = result) }
+                notify("Умный скан: ${translations.size} блоков переведено · ${formatSeconds(result.totalMs)}")
+            } catch (cancelled: CancellationException) {
+                mutate { it.copy(smartRunning = false) }
+                throw cancelled
+            } catch (exception: Exception) {
+                mutate { it.copy(smartRunning = false, error = friendlyError(exception)) }
+                notify("Умный скан не удался")
+            }
+        }
     }
 
     fun runStyleStressTest() {
@@ -884,13 +1122,45 @@ class ScanViewModel @Inject constructor(
         }
     }
 
+    private fun isDebuggableBuild(): Boolean =
+        (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
+    private fun debugSmartRun(
+        document: ScanDocument,
+        rendered: Bitmap,
+        stages: List<SmartLabStage>,
+        page: String?,
+    ) {
+        val tag = "LensLateSmart"
+        document.regions.forEach { region ->
+            val appearance = region.appearance
+            val color = appearance?.foregroundArgb?.let { "#%06X".format(it and 0xFFFFFF) }
+            val background = appearance?.localBackgroundArgb?.let { "#%06X".format(it and 0xFFFFFF) }
+            Log.i(
+                tag,
+                "text=${region.text.replace('\n', '/')} | tr=${region.translation?.replace('\n', '/')} | " +
+                    "conf=${region.confidence} | color=$color | bg=$background | " +
+                    "font=${appearance?.fontKey} | weight=${appearance?.fontWeight} | " +
+                    "size=${appearance?.textHeightPx} | spacing=${appearance?.spacingPx} | " +
+                    "slant=${appearance?.slantDegrees} | bounds=${region.bounds}",
+            )
+        }
+        stages.forEach { stage ->
+            Log.i(tag, "stage=${stage.title} ${stage.durationMs}ms · ${stage.detail}")
+        }
+        runCatching {
+            val dir = File(context.getExternalFilesDir(LAB_PAGES_DIR), "debug").apply { mkdirs() }
+            val base = page?.substringBeforeLast('.') ?: "photo"
+            val file = File(dir, "smart_${base}_out.png")
+            file.outputStream().use { rendered.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            Log.i(tag, "saved=${file.absolutePath}")
+        }.onFailure { Log.i(tag, "save failed: ${it.message}") }
+    }
+
     private companion object {
         const val APPROXIMATE_MODEL_MB = 30
-
-        /**
-         * Blocks below this OCR confidence are left as the original: a wrong
-         * reading painted over the photo looks worse than untranslated text.
-         */
-        const val MIN_REPLACE_CONFIDENCE = 0.70f
+        const val LAB_PAGES_DIR = "lab"
+        val LAB_PAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "bmp")
+        const val SMART_DEEP_PASSES = 20
     }
 }

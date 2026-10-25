@@ -9,8 +9,37 @@ internal object OcrTextRepair {
 
     fun repair(text: String): String {
         if (text.isBlank()) return text
-        val spaced = MISSING_COLON_GAP.replace(text, ": ")
-        return TOKEN.replace(spaced) { match -> repairCodeToken(match.value) }
+        // Tesseract turns the middle dot of "акустика · свет" into a spaced
+        // apostrophe; the translator then reads it as quotation marks and
+        // traduces the sentence. Restore the decorative separator.
+        val separated = DECORATIVE_QUOTE.replace(text, "·")
+        val spaced = MISSING_COLON_GAP.replace(separated, ": ")
+        val cleaned = spaced
+            .lines()
+            .joinToString("\n") { line -> repairLine(line) }
+            .trim()
+        return TOKEN.replace(cleaned) { match -> repairCodeToken(match.value) }
+    }
+
+    private fun repairLine(line: String): String {
+        if (line.isBlank()) return ""
+        var trimmed = TRAILING_NOISE.replace(LEADING_NOISE.replace(line, ""), "")
+        // Sparse segmentation sometimes glues a slash and a period to the end of
+        // a sentence ("ЯРКОСТИ ./Проверка"), which then breaks the translation.
+        trimmed = SENTENCE_SLASH.replace(trimmed) { match ->
+            "${match.groupValues[1]} "
+        }
+        trimmed = trimmed.replace(SPACED_COLON_INSIDE, ":")
+        if (isDisplayCaps(trimmed)) {
+            trimmed = CAPS_SEPARATOR.replace(trimmed, " · ")
+        }
+        return trimmed.replace(DOUBLE_SPACE, " ").trim()
+    }
+
+    private fun isDisplayCaps(line: String): Boolean {
+        val letters = line.filter(Char::isLetter)
+        if (letters.length < CAPS_MIN_LETTERS) return false
+        return letters.all { it.isUpperCase() }
     }
 
     private fun repairCodeToken(token: String): String {
@@ -30,7 +59,15 @@ internal object OcrTextRepair {
     }
 
     private val MISSING_COLON_GAP = Regex(":(?=\\p{L})")
+    private val DECORATIVE_QUOTE = Regex("(?<=\\s)['’‘`´](?=\\s)")
+    private val LEADING_NOISE = Regex("^[\\s_^`~\\\\|<>{}\\[\\]]+[.,;:/\\-–—]*")
+    private val TRAILING_NOISE = Regex("[\\s_^`~\\\\|<>{}\\[\\]]+$")
+    private val SENTENCE_SLASH = Regex("\\s*([.!?…])\\s*[/\\\\]+\\s*(?=[А-ЯЁA-Z])")
+    private val SPACED_COLON_INSIDE = Regex("(?<=\\d):\\s+(?=\\d{2}(?!\\d))")
+    private val CAPS_SEPARATOR = Regex("\\s+[-–]\\s+")
+    private val DOUBLE_SPACE = Regex(" {2,}")
     private val TOKEN = Regex("\\S+")
+    private const val CAPS_MIN_LETTERS = 3
     private val CYRILLIC_RANGE = '\u0400'..'\u04FF'
     private val CODE_PUNCTUATION = charArrayOf('-', '—', '–', '/', '.', ',')
     private val CODE_LOOKALIKES = mapOf(

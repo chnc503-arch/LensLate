@@ -44,6 +44,7 @@ internal object OcrQualityScorer {
     fun evaluate(
         candidate: OcrScoreCandidate,
         others: List<OcrScoreCandidate>,
+        lexical: Boolean = false,
     ): OcrScoreBreakdown {
         val normalized = normalize(candidate.text)
         if (normalized.isEmpty()) return OcrScoreBreakdown()
@@ -53,7 +54,13 @@ internal object OcrQualityScorer {
         val confidence = confidenceScore(candidate)
         val consensus = consensusScore(candidate.text, others.map { it.text })
         val coverage = coverageScore(normalized.length, others)
-        val linguistic = linguisticScore(stats)
+        val structuralLinguistic = linguisticScore(stats)
+        val linguistic = if (lexical) {
+            0.6f * structuralLinguistic +
+                0.4f * RussianLanguageModel.lexicalScore(candidate.text)
+        } else {
+            structuralLinguistic
+        }
         val layout = layoutScore(candidate.regions)
         val noise = noiseScore(stats)
         val weighted =
@@ -74,9 +81,16 @@ internal object OcrQualityScorer {
         )
     }
 
-    fun rank(candidates: List<OcrScoreCandidate>): List<OcrScoreBreakdown> =
+    fun rank(
+        candidates: List<OcrScoreCandidate>,
+        lexical: Boolean = false,
+    ): List<OcrScoreBreakdown> =
         candidates.mapIndexed { index, candidate ->
-            evaluate(candidate, candidates.filterIndexed { other, _ -> other != index })
+            evaluate(
+                candidate = candidate,
+                others = candidates.filterIndexed { other, _ -> other != index },
+                lexical = lexical,
+            )
         }
 
     private fun confidenceScore(candidate: OcrScoreCandidate): Float {

@@ -471,6 +471,10 @@ fun LensLateApp(
                     onAggressiveSanitizer = viewModel::setAggressiveSanitizer,
                     onPreviewProtection = viewModel::previewProtectionMap,
                     onRunStyleStress = viewModel::runStyleStressTest,
+                    onRunSmart = viewModel::runSmartLab,
+                    onClearSmart = viewModel::clearSmartResult,
+                    onLoadLabPage = viewModel::loadLabPage,
+                    onRefreshLabPages = viewModel::refreshLabPages,
                 )
             }
         }

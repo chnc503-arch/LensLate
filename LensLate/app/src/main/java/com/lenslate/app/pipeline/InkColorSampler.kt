@@ -33,16 +33,159 @@ internal object InkColorSampler {
     }
 
     /**
+     * Which side of the paper the glyphs live on. White-on-white posters put
+     * the ink *above* the background while their drop shadow sits below it;
+     * a region-wide "farthest colour" therefore reports the shadow as ink.
+     * Comparing how many pixels support each side picks the strokes, because
+     * they cover more of the glyph than their offset shadow does.
+     */
+    data class InkEstimate(
+        val color: Int,
+        val distanceSq: Float,
+        val light: Boolean,
+        val support: Int,
+        val haloColor: Int?,
+        val haloDistanceSq: Float,
+        val haloSupport: Int,
+        val haloOffsetX: Float,
+        val haloOffsetY: Float,
+    )
+
+    fun estimateInk(
+        pixels: IntArray,
+        width: Int,
+        background: Int,
+    ): InkEstimate? {
+        if (pixels.isEmpty() || width <= 0) return null
+        val stride = max(1, sqrt(pixels.size.toFloat() / MAX_INK_SAMPLES).toInt())
+        val backgroundLuminance = luminance(background)
+        var lightMax = 0f
+        var darkMax = 0f
+        var index = 0
+        var samples = 0
+        while (index < pixels.size) {
+            val pixel = pixels[index]
+            if (alpha(pixel) >= MIN_INK_SAMPLE_ALPHA) {
+                val distance = distanceSq(pixel, background)
+                if (luminance(pixel) >= backgroundLuminance) {
+                    if (distance > lightMax) lightMax = distance
+                } else if (distance > darkMax) {
+                    darkMax = distance
+                }
+                samples++
+            }
+            index += stride
+        }
+        if (samples == 0) return null
+        val lightBand = lightMax * SIDE_BAND_RATIO
+        val darkBand = darkMax * SIDE_BAND_RATIO
+        var lightCount = 0
+        var darkCount = 0
+        var lightX = 0.0
+        var lightY = 0.0
+        var darkX = 0.0
+        var darkY = 0.0
+        index = 0
+        while (index < pixels.size) {
+            val pixel = pixels[index]
+            if (alpha(pixel) >= MIN_INK_SAMPLE_ALPHA) {
+                val distance = distanceSq(pixel, background)
+                val x = index % width
+                val y = index / width
+                if (luminance(pixel) >= backgroundLuminance) {
+                    if (distance >= lightBand) {
+                        lightCount++
+                        lightX += x
+                        lightY += y
+                    }
+                } else if (distance >= darkBand) {
+                    darkCount++
+                    darkX += x
+                    darkY += y
+                }
+            }
+            index += stride
+        }
+        val lightWins = lightCount >= darkCount
+        val inkMax = if (lightWins) lightMax else darkMax
+        val inkSupport = if (lightWins) lightCount else darkCount
+        val haloMax = if (lightWins) darkMax else lightMax
+        val haloSupport = if (lightWins) darkCount else lightCount
+        val minimumSupport = max(MIN_INK_SAMPLE_SUPPORT, samples / MIN_INK_SUPPORT_DIVISOR)
+        if (inkMax < MIN_INK_SIGNAL_SQ || inkSupport < minimumSupport) return null
+
+        val inkBand = inkMax * SIDE_BAND_RATIO
+        val haloBand = haloMax * SIDE_BAND_RATIO
+        val inkColors = ArrayList<Int>()
+        val haloColors = ArrayList<Int>()
+        var inkX = 0.0
+        var inkY = 0.0
+        var countedInk = 0
+        var haloX = 0.0
+        var haloY = 0.0
+        var countedHalo = 0
+        index = 0
+        while (index < pixels.size) {
+            val pixel = pixels[index]
+            if (alpha(pixel) >= MIN_INK_SAMPLE_ALPHA) {
+                val distance = distanceSq(pixel, background)
+                val light = luminance(pixel) >= backgroundLuminance
+                if (light == lightWins) {
+                    if (distance >= inkBand) {
+                        inkColors += pixel
+                        inkX += index % width
+                        inkY += index / width
+                        countedInk++
+                    }
+                } else if (distance >= haloBand) {
+                    haloColors += pixel
+                    haloX += index % width
+                    haloY += index / width
+                    countedHalo++
+                }
+            }
+            index += stride
+        }
+        if (inkColors.isEmpty()) return null
+        val haloPresent = haloColors.isNotEmpty() &&
+            haloMax >= MIN_HALO_SIGNAL_SQ &&
+            countedHalo.toFloat() / max(1, countedInk) >= MIN_HALO_SUPPORT_RATIO
+        val offsetX = if (haloPresent && countedHalo > 0 && countedInk > 0) {
+            (haloX / countedHalo - inkX / countedInk).toFloat()
+        } else {
+            0f
+        }
+        val offsetY = if (haloPresent && countedHalo > 0 && countedInk > 0) {
+            (haloY / countedHalo - inkY / countedInk).toFloat()
+        } else {
+            0f
+        }
+        return InkEstimate(
+            color = medianColor(inkColors),
+            distanceSq = inkMax,
+            light = lightWins,
+            support = inkSupport,
+            haloColor = if (haloPresent) medianColor(haloColors) else null,
+            haloDistanceSq = haloMax,
+            haloSupport = haloSupport,
+            haloOffsetX = offsetX,
+            haloOffsetY = offsetY,
+        )
+    }
+
+    /**
      * How the ink colour of a glyph is chosen from its pixels.
      *
-     * [LOCAL] is the production path: median of strong pixels against the local
-     * backdrop. [PEAK] averages the most-covered quartile instead of the median,
-     * which keeps more saturation when blur has no fully covered core, and
-     * accepts very low contrast so a washed-out glyph is not replaced by the
-     * paragraph colour. It is experimental and only runs in the lab until it is
-     * approved for scanning.
+     * [LOCAL] is the previous scan path: median of strong pixels against the
+     * local backdrop. [PEAK] averages the most-covered quartile instead of the
+     * median, which keeps more saturation when blur has no fully covered core,
+     * and accepts very low contrast so a washed-out glyph is not replaced by
+     * the paragraph colour. [ADAPTIVE] now drives the scan: it keeps the exact
+     * LOCAL result whenever a glyph has a solid ink core and switches to PEAK
+     * only for faint ink, where LOCAL would discard the sampled colour. Only
+     * PEAK stays test-only.
      */
-    enum class Mode { LOCAL, PEAK }
+    enum class Mode { LOCAL, PEAK, ADAPTIVE }
 
     fun estimateBackdrop(
         topStrip: IntArray,
@@ -86,28 +229,61 @@ internal object InkColorSampler {
         backdrop: Backdrop,
         fallbackInk: Int,
         mode: Mode = Mode.LOCAL,
+        inkLight: Boolean? = null,
     ): Int {
+        sampleGlyphCore(pixels, width, glyphTop, glyphBottom, backdrop, mode, inkLight)
+            ?.let { return it }
+        // A local gradient can flip the expected polarity; the unconstrained
+        // pass keeps the old behaviour instead of dropping the glyph colour.
+        if (inkLight != null) {
+            sampleGlyphCore(pixels, width, glyphTop, glyphBottom, backdrop, mode, null)
+                ?.let { return it }
+        }
+        return fallbackInk
+    }
+
+    /**
+     * [inkLight] restricts sampling to pixels on the same side of the local
+     * backdrop as the region ink. Without it a white glyph's dark drop shadow
+     * is the strongest signal inside the glyph box and is sampled instead.
+     */
+    private fun sampleGlyphCore(
+        pixels: IntArray,
+        width: Int,
+        glyphTop: Int,
+        glyphBottom: Int,
+        backdrop: Backdrop,
+        mode: Mode,
+        inkLight: Boolean?,
+    ): Int? {
         val rows = glyphBottom - glyphTop
-        if (width <= 0 || rows <= 0) return fallbackInk
-        if (pixels.size < width * (glyphTop + rows)) return fallbackInk
+        if (width <= 0 || rows <= 0) return null
+        if (pixels.size < width * (glyphTop + rows)) return null
 
         val distances = FloatArray(width * rows)
         var maximumDistance = 0f
         for (row in 0 until rows) {
             val fraction = if (rows <= 1) 0.5f else row.toFloat() / (rows - 1)
             val reference = backdrop.colorAt(fraction)
+            val referenceLuminance = luminance(reference)
             val rowOffset = (glyphTop + row) * width
             for (x in 0 until width) {
                 val pixel = pixels[rowOffset + x]
                 if (alpha(pixel) < MIN_CHARACTER_ALPHA) continue
+                if (inkLight != null &&
+                    (luminance(pixel) >= referenceLuminance) != inkLight
+                ) {
+                    continue
+                }
                 val distance = distanceSq(pixel, reference)
                 val index = row * width + x
                 distances[index] = distance
                 if (distance > maximumDistance) maximumDistance = distance
             }
         }
-        val floor = if (mode == Mode.PEAK) MIN_PEAK_CHARACTER_DISTANCE_SQ else MIN_CHARACTER_DISTANCE_SQ
-        if (maximumDistance < floor) return fallbackInk
+        val acceptsFaintInk = mode != Mode.LOCAL
+        val floor = if (acceptsFaintInk) MIN_PEAK_CHARACTER_DISTANCE_SQ else MIN_CHARACTER_DISTANCE_SQ
+        if (maximumDistance < floor) return null
 
         val threshold = max(floor, maximumDistance * CHARACTER_STRONG_RATIO)
         val candidates = ArrayList<Int>()
@@ -118,10 +294,16 @@ internal object InkColorSampler {
                 candidateDistances += distances[index]
             }
         }
-        if (candidates.isEmpty()) return fallbackInk
+        if (candidates.isEmpty()) return null
+        val faint = maximumDistance < MIN_CHARACTER_DISTANCE_SQ
         return when (mode) {
             Mode.LOCAL -> medianColor(candidates)
             Mode.PEAK -> peakColor(candidates, candidateDistances)
+            Mode.ADAPTIVE -> if (faint) {
+                peakColor(candidates, candidateDistances)
+            } else {
+                medianColor(candidates)
+            }
         }
     }
 
@@ -197,11 +379,23 @@ internal object InkColorSampler {
     private fun red(color: Int): Int = (color shr 16) and 0xFF
     private fun green(color: Int): Int = (color shr 8) and 0xFF
     private fun blue(color: Int): Int = color and 0xFF
+    private fun luminance(color: Int): Float =
+        (0.2126f * red(color) + 0.7152f * green(color) + 0.0722f * blue(color)) / 255f
 
     private const val MIN_CHARACTER_ALPHA = 40
+    private const val MAX_INK_SAMPLES = 90_000
+    private const val MIN_INK_SAMPLE_ALPHA = 40
+    private const val SIDE_BAND_RATIO = 0.5f
+    private const val MIN_INK_SIGNAL_SQ = 0.0008f
+    private const val MIN_HALO_SIGNAL_SQ = 0.004f
+    private const val MIN_HALO_SUPPORT_RATIO = 0.05f
+    private const val MIN_INK_SAMPLE_SUPPORT = 4
+    private const val MIN_INK_SUPPORT_DIVISOR = 300
     private const val MIN_STRIP_ALPHA = 40
     private const val MIN_CHARACTER_DISTANCE_SQ = 0.045f
-    private const val MIN_PEAK_CHARACTER_DISTANCE_SQ = 0.0025f
+    // Extreme overexposure leaves barely ten grey levels between ink and
+    // paper; the old 0.0025 floor discarded exactly those glyphs.
+    private const val MIN_PEAK_CHARACTER_DISTANCE_SQ = 0.0005f
     private const val CHARACTER_STRONG_RATIO = 0.62f
     private const val PEAK_SHARE = 0.25f
     private const val MIN_STRIP_PIXELS = 8

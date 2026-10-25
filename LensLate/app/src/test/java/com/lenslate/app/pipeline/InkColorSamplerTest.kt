@@ -201,6 +201,232 @@ class InkColorSamplerTest {
         assertColorNear(faintInk, peak, tolerance = 3)
     }
 
+    @Test
+    fun adaptiveModeKeepsTheMedianResultForSolidInk() {
+        // A glyph with a covered core must stay on the production LOCAL result;
+        // the adaptive candidate may only change faint glyphs.
+        val width = 10
+        val glyphRows = 6
+        val height = glyphRows + 8
+        val crop = solid(width, height, light)
+        for (row in 4 until 4 + glyphRows) {
+            for (x in 2 until 8) {
+                crop[row * width + x] = red
+            }
+        }
+        val backdrop = InkColorSampler.estimateBackdrop(
+            crop.copyOfRange(0, 4 * width),
+            crop.copyOfRange((4 + glyphRows) * width, crop.size),
+            light,
+            red,
+        )
+        val local = InkColorSampler.sampleGlyphColor(
+            pixels = crop,
+            width = width,
+            glyphTop = 4,
+            glyphBottom = 4 + glyphRows,
+            backdrop = backdrop,
+            fallbackInk = green,
+        )
+        val adaptive = InkColorSampler.sampleGlyphColor(
+            pixels = crop,
+            width = width,
+            glyphTop = 4,
+            glyphBottom = 4 + glyphRows,
+            backdrop = backdrop,
+            fallbackInk = green,
+            mode = InkColorSampler.Mode.ADAPTIVE,
+        )
+        assertEquals(local, adaptive)
+        assertColorNear(red, adaptive, tolerance = 3)
+    }
+
+    @Test
+    fun adaptiveModeSamplesFaintLightInk() {
+        val width = 10
+        val glyphRows = 6
+        val height = glyphRows + 8
+        val faintInk = 0xFFDCDCDC.toInt()
+        val crop = solid(width, height, light)
+        for (row in 4 until 4 + glyphRows) {
+            for (x in 2 until 8) {
+                crop[row * width + x] = faintInk
+            }
+        }
+        val backdrop = InkColorSampler.estimateBackdrop(
+            crop.copyOfRange(0, 4 * width),
+            crop.copyOfRange((4 + glyphRows) * width, crop.size),
+            light,
+            green,
+        )
+        val adaptive = InkColorSampler.sampleGlyphColor(
+            pixels = crop,
+            width = width,
+            glyphTop = 4,
+            glyphBottom = 4 + glyphRows,
+            backdrop = backdrop,
+            fallbackInk = green,
+            mode = InkColorSampler.Mode.ADAPTIVE,
+        )
+        assertColorNear(faintInk, adaptive, tolerance = 3)
+    }
+
+    @Test
+    fun adaptiveModeSamplesExtremelyOverexposedInk() {
+        // Eight grey levels between ink and paper: the previous 0.0025 floor
+        // classified this as no ink and painted the translation black.
+        val width = 10
+        val glyphRows = 6
+        val height = glyphRows + 8
+        val paper = 0xFFFFFFFF.toInt()
+        val faintInk = 0xFFF7F7F7.toInt()
+        val crop = solid(width, height, paper)
+        for (row in 4 until 4 + glyphRows) {
+            for (x in 2 until 8) {
+                crop[row * width + x] = faintInk
+            }
+        }
+        val backdrop = InkColorSampler.estimateBackdrop(
+            crop.copyOfRange(0, 4 * width),
+            crop.copyOfRange((4 + glyphRows) * width, crop.size),
+            paper,
+            green,
+        )
+        val adaptive = InkColorSampler.sampleGlyphColor(
+            pixels = crop,
+            width = width,
+            glyphTop = 4,
+            glyphBottom = 4 + glyphRows,
+            backdrop = backdrop,
+            fallbackInk = green,
+            mode = InkColorSampler.Mode.ADAPTIVE,
+        )
+        assertColorNear(faintInk, adaptive, tolerance = 2)
+    }
+
+    @Test
+    fun adaptiveModeSamplesFaintNearBlackInk() {
+        val width = 10
+        val glyphRows = 6
+        val height = glyphRows + 8
+        val faintInk = 0xFF181818.toInt()
+        val crop = solid(width, height, dark)
+        for (row in 4 until 4 + glyphRows) {
+            for (x in 2 until 8) {
+                crop[row * width + x] = faintInk
+            }
+        }
+        val backdrop = InkColorSampler.estimateBackdrop(
+            crop.copyOfRange(0, 4 * width),
+            crop.copyOfRange((4 + glyphRows) * width, crop.size),
+            dark,
+            red,
+        )
+        val local = InkColorSampler.sampleGlyphColor(
+            pixels = crop,
+            width = width,
+            glyphTop = 4,
+            glyphBottom = 4 + glyphRows,
+            backdrop = backdrop,
+            fallbackInk = red,
+        )
+        val adaptive = InkColorSampler.sampleGlyphColor(
+            pixels = crop,
+            width = width,
+            glyphTop = 4,
+            glyphBottom = 4 + glyphRows,
+            backdrop = backdrop,
+            fallbackInk = red,
+            mode = InkColorSampler.Mode.ADAPTIVE,
+        )
+        assertEquals("local mode cannot see ink this dark", red, local)
+        assertColorNear(faintInk, adaptive, tolerance = 3)
+    }
+
+    @Test
+    fun whiteOnWhiteInkWinsOverItsDropShadow() {
+        // Page 08: white glyphs on white paper. The farthest colour in the
+        // region is the grey shadow, not the ink; pixel support must decide.
+        val width = 80
+        val height = 20
+        val crop = solid(width, height, paper)
+        for (y in 3 until 15) {
+            for (x in 10 until 70) crop[y * width + x] = whiteInk
+        }
+        for (y in 15 until 19) {
+            for (x in 10 until 70) crop[y * width + x] = shadow
+        }
+        val estimate = InkColorSampler.estimateInk(crop, width, paper)
+        assertTrue("white-on-white ink must be detected", estimate != null)
+        val ink = requireNotNull(estimate)
+        assertTrue("ink must be on the light side", ink.light)
+        assertColorNear(whiteInk, ink.color, tolerance = 3)
+        assertEquals(60 * 12, ink.support)
+        assertEquals("the drop shadow is the halo", shadow, ink.haloColor)
+        assertTrue("shadow sits below the ink: ${ink.haloOffsetY}", ink.haloOffsetY > 0f)
+    }
+
+    @Test
+    fun darkInkWinsOverAThinLightGlow() {
+        val width = 60
+        val height = 30
+        val crop = solid(width, height, light)
+        for (y in 3 until 9) {
+            for (x in 10 until 50) crop[y * width + x] = 0xFFFFFFFF.toInt()
+        }
+        for (y in 9 until 23) {
+            for (x in 10 until 50) crop[y * width + x] = black
+        }
+        val estimate = InkColorSampler.estimateInk(crop, width, light)
+        assertTrue("dark ink must be detected", estimate != null)
+        val ink = requireNotNull(estimate)
+        assertTrue("ink must be on the dark side", !ink.light)
+        assertColorNear(black, ink.color, tolerance = 3)
+        assertEquals(null, ink.haloColor)
+    }
+
+    @Test
+    fun inkLightHintSkipsTheShadowInsideTheGlyphBox() {
+        // One glyph box contains both the white stroke and its grey shadow.
+        // Without the hint the shadow is the strongest pixel and is sampled.
+        val width = 20
+        val height = 12
+        val crop = solid(width, height, paper)
+        for (y in 2 until 8) {
+            for (x in 3 until 17) crop[y * width + x] = whiteInk
+        }
+        for (y in 8 until 10) {
+            for (x in 3 until 17) crop[y * width + x] = shadow
+        }
+        val backdrop = InkColorSampler.estimateBackdrop(
+            solid(width, 1, paper),
+            solid(width, 1, paper),
+            paper,
+            whiteInk,
+        )
+        val unconstrained = InkColorSampler.sampleGlyphColor(
+            pixels = crop,
+            width = width,
+            glyphTop = 2,
+            glyphBottom = 10,
+            backdrop = backdrop,
+            fallbackInk = whiteInk,
+            mode = InkColorSampler.Mode.ADAPTIVE,
+        )
+        val hinted = InkColorSampler.sampleGlyphColor(
+            pixels = crop,
+            width = width,
+            glyphTop = 2,
+            glyphBottom = 10,
+            backdrop = backdrop,
+            fallbackInk = whiteInk,
+            mode = InkColorSampler.Mode.ADAPTIVE,
+            inkLight = true,
+        )
+        assertColorNear(shadow, unconstrained, tolerance = 3)
+        assertColorNear(whiteInk, hinted, tolerance = 3)
+    }
+
     private fun solid(width: Int, height: Int, color: Int): IntArray =
         IntArray(width * height) { color }
 
@@ -218,11 +444,15 @@ class InkColorSamplerTest {
 
     private companion object {
         val black = 0xFF101010.toInt()
+        val dark = 0xFF303030.toInt()
         val gray = 0xFF808080.toInt()
         val light = 0xFFF0F0F0.toInt()
         val warm = 0xFFF0E0D0.toInt()
         val cold = 0xFF302010.toInt()
         val red = 0xFFFF0000.toInt()
         val green = 0xFF00FF00.toInt()
+        val paper = 0xFFF7F3E8.toInt()
+        val whiteInk = 0xFFFFFCF3.toInt()
+        val shadow = 0xFFC7C3BA.toInt()
     }
 }

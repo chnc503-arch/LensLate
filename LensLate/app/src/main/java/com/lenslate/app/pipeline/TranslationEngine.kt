@@ -74,9 +74,39 @@ class TranslationEngine @Inject constructor() {
 
     suspend fun translate(text: String, pair: TranslationPair): String {
         if (text.isBlank() || pair.isIdentity) return text
-        val prepared = TechnicalGlossary.prepare(text, pair.from, pair.to)
+        val displayCaps = TranslationTextGuard.isAllCaps(text)
+        val normalized = if (displayCaps) TranslationTextGuard.sentenceCase(text) else text
         val translator = translatorFor(pair)
         translator.downloadModelIfNeeded(downloadConditions).await()
+
+        var best = translateAttempt(translator, normalized, pair)
+        if (TranslationTextGuard.isMixedAnswer(best, pair.to)) {
+            // The two attempts differ only in casing, which is often enough for
+            // the model to stop echoing the source alphabet; keep whichever
+            // answer contains less of the wrong script.
+            val alternate = if (displayCaps) text else TranslationTextGuard.sentenceCase(text)
+            if (alternate != normalized) {
+                val fallback = runCatching { translateAttempt(translator, alternate, pair) }.getOrNull()
+                if (fallback != null &&
+                    TranslationTextGuard.foreignLetterShare(fallback, pair.to) <
+                    TranslationTextGuard.foreignLetterShare(best, pair.to)
+                ) {
+                    best = fallback
+                }
+            }
+        }
+        return TranslationTextGuard.restoreDisplayCase(
+            TranslationSeparatorGuard.restore(text, best),
+            displayCaps,
+        )
+    }
+
+    private suspend fun translateAttempt(
+        translator: Translator,
+        text: String,
+        pair: TranslationPair,
+    ): String {
+        val prepared = TechnicalGlossary.prepare(text, pair.from, pair.to)
         val translated = translator.translate(prepared.text).await()
         return TechnicalGlossary.refine(
             TechnicalGlossary.restore(translated, prepared.tokens),

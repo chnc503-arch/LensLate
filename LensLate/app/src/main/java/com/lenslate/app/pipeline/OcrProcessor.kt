@@ -108,6 +108,8 @@ class OcrProcessor @Inject constructor(
         forcedVariantName: String? = null,
         aggressiveSanitizer: Boolean = false,
         protectEmbeddedImages: Boolean = true,
+        maxCyrillicPasses: Int = MAX_CYRILLIC_PREPROCESS_PASSES,
+        lexicalRepair: Boolean = false,
     ): ScanDocument {
         require(imageInfo.workingWidth == bitmap.width && imageInfo.workingHeight == bitmap.height) {
             "Image metadata does not match the OCR bitmap dimensions."
@@ -133,6 +135,8 @@ class OcrProcessor @Inject constructor(
                 scanMode = scanMode,
                 strictCyrillic = strictVariant,
                 aggressiveSanitizer = aggressiveSanitizer,
+                maxCyrillicPasses = maxCyrillicPasses,
+                lexicalRepair = lexicalRepair,
             )
             OcrEngineChoice.CYRILLIC -> processCyrillic(
                 bitmap = bitmap,
@@ -142,6 +146,8 @@ class OcrProcessor @Inject constructor(
                 scanMode = scanMode,
                 strictVariant = strictVariant,
                 aggressiveSanitizer = aggressiveSanitizer,
+                maxCyrillicPasses = maxCyrillicPasses,
+                lexicalRepair = lexicalRepair,
             )
             OcrEngineChoice.JAPANESE -> processMlKit(
                 bitmap = bitmap,
@@ -371,6 +377,8 @@ class OcrProcessor @Inject constructor(
         scanMode: ScanMode,
         strictCyrillic: Boolean = false,
         aggressiveSanitizer: Boolean = false,
+        maxCyrillicPasses: Int = MAX_CYRILLIC_PREPROCESS_PASSES,
+        lexicalRepair: Boolean = false,
     ): ScanDocument {
         val fingerprint = try {
             tesseractEngine.recognize(bitmap, TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT)
@@ -388,6 +396,7 @@ class OcrProcessor @Inject constructor(
                     seedRegions = fingerprint,
                     strictVariant = strictCyrillic,
                     aggressive = aggressiveSanitizer,
+                    maxPasses = maxCyrillicPasses,
                 )
             } catch (exception: CancellationException) {
                 throw exception
@@ -402,6 +411,7 @@ class OcrProcessor @Inject constructor(
                 experimentMode,
                 scanMode,
                 aggressiveSanitizer,
+                lexicalRepair,
             )
         }
         // A cheap probe decides the script before paying for every enhancement
@@ -448,6 +458,8 @@ class OcrProcessor @Inject constructor(
         scanMode: ScanMode,
         strictVariant: Boolean = false,
         aggressiveSanitizer: Boolean = false,
+        maxCyrillicPasses: Int = MAX_CYRILLIC_PREPROCESS_PASSES,
+        lexicalRepair: Boolean = false,
     ): ScanDocument {
         val passes = try {
             recognizeCyrillicPasses(
@@ -456,6 +468,7 @@ class OcrProcessor @Inject constructor(
                 experimentMode,
                 strictVariant = strictVariant,
                 aggressive = aggressiveSanitizer,
+                maxPasses = maxCyrillicPasses,
             )
         } catch (exception: CancellationException) {
             throw exception
@@ -469,13 +482,14 @@ class OcrProcessor @Inject constructor(
             )
         }
         return documentFromCyrillicPasses(
-            passes,
-            bitmap,
-            imageInfo,
-            plan,
-            experimentMode,
-            scanMode,
-            aggressiveSanitizer,
+            passes = passes,
+            bitmap = bitmap,
+            imageInfo = imageInfo,
+            plan = plan,
+            experimentMode = experimentMode,
+            scanMode = scanMode,
+            aggressiveSanitizer = aggressiveSanitizer,
+            lexicalRepair = lexicalRepair,
         )
     }
 
@@ -487,6 +501,7 @@ class OcrProcessor @Inject constructor(
         seedRegions: List<TextRegionRecord>? = null,
         strictVariant: Boolean = false,
         aggressive: Boolean = false,
+        maxPasses: Int = MAX_CYRILLIC_PREPROCESS_PASSES,
     ): List<OcrPass> {
         if (strictVariant) {
             val spec = plan.variants.first()
@@ -532,7 +547,8 @@ class OcrProcessor @Inject constructor(
         // Rotated inputs are essential for Cyrillic too: Tesseract tolerates only
         // a few degrees, so a skewed page would otherwise lose whole lines.
         // The lab intentionally runs every hypothesis; a normal scan keeps a cap.
-        val variantLimit = if (experimentMode) Int.MAX_VALUE else MAX_CYRILLIC_PREPROCESS_PASSES
+        val variantLimit = (if (experimentMode) Int.MAX_VALUE else MAX_CYRILLIC_PREPROCESS_PASSES)
+            .coerceAtMost(maxPasses)
         val variants = plan.variants
             .filter { spec ->
                 spec.operation != PreprocessOperation.ORIGINAL || spec.rotationDegrees != 0f
@@ -551,6 +567,23 @@ class OcrProcessor @Inject constructor(
                 if (regions.isNotEmpty()) {
                     passes += OcrPass("tesseract-${spec.name}", regions)
                 }
+                // Sparse segmentation splits faint display lines into fragments. The
+                // enhanced polarity recipes are exactly where whole-line layout
+                // reconstruction changes the answer, so the same bitmap gets a
+                // second segmentation hypothesis.
+                if (spec.rotationDegrees == 0f && spec.stages.any { stage ->
+                        stage.operation == PreprocessOperation.INVERT ||
+                            stage.operation == PreprocessOperation.LOCAL_NORMALIZE
+                    }
+                ) {
+                    val autoRegions = OcrGeometryMapper.mapRegions(
+                        regions = tesseractEngine.recognize(input, TessBaseAPI.PageSegMode.PSM_AUTO),
+                        transform = prepared.inputToWorking,
+                    )
+                    if (autoRegions.isNotEmpty()) {
+                        passes += OcrPass("tesseract-${spec.name}-auto", autoRegions)
+                    }
+                }
             } catch (exception: CancellationException) {
                 throw exception
             } catch (_: Exception) {
@@ -563,16 +596,28 @@ class OcrProcessor @Inject constructor(
         // win consensus and pull honest readings into a merge with them.
         return passes
             .map { pass ->
-                pass.copy(
-                    regions = regionSanitizer
-                        .sanitizeText(pass.regions, OcrSanitizerProfile.TESSERACT, aggressive)
-                        .regions,
+                val result = regionSanitizer
+                    .sanitizeText(pass.regions, OcrSanitizerProfile.TESSERACT, aggressive)
+                android.util.Log.i(
+                    "LensLateOcr",
+                    "pass=${pass.name} raw=" + pass.regions.joinToString(" | ") {
+                        "${it.text.replace('\n', '/')}@${it.confidence}@${it.bounds}"
+                    },
                 )
+                if (result.dropped.isNotEmpty()) {
+                    android.util.Log.i(
+                        "LensLateOcr",
+                        "dropped=${pass.name} " + result.dropped.joinToString(" | ") {
+                            "${it.text.replace('\n', '/')}:${it.reason}@${it.confidence}"
+                        },
+                    )
+                }
+                pass.copy(regions = result.regions)
             }
             .filter { it.regions.isNotEmpty() }
     }
 
-    private fun documentFromCyrillicPasses(
+    private suspend fun documentFromCyrillicPasses(
         passes: List<OcrPass>,
         bitmap: Bitmap,
         imageInfo: ScanImageInfo,
@@ -580,6 +625,7 @@ class OcrProcessor @Inject constructor(
         experimentMode: Boolean,
         scanMode: ScanMode,
         aggressiveSanitizer: Boolean = false,
+        lexicalRepair: Boolean = false,
     ): ScanDocument {
         if (passes.isEmpty()) {
             return ScanDocument(
@@ -593,20 +639,51 @@ class OcrProcessor @Inject constructor(
                 scanMode = scanMode,
             )
         }
-        val scores = scorePasses(passes)
+        // The lab's deep pass pays for the offline lexicon; the regular scan
+        // keeps the structural scoring so its behaviour and speed are unchanged.
+        val lexical = experimentMode
+        val scores = scorePasses(passes, lexical)
         val selected = selectPass(passes, scores)
         val selectedScore = scores[selected.name]?.total ?: 0f
+        android.util.Log.i(
+            "LensLateOcr",
+            "passes=" + passes.joinToString { "${it.name}:${it.regions.size}/${it.averageConfidence}" },
+        )
+        android.util.Log.i(
+            "LensLateOcr",
+            "selected=${selected.name} selectedScore=$selectedScore",
+        )
         val mergeCandidates = passes.flatMap { pass ->
             val passScore = scores[pass.name]?.total ?: 0f
             pass.regions
                 .filter { region ->
-                    pass === selected ||
-                        (region.confidence?.let { it >= MIN_CYRILLIC_MERGE_CONFIDENCE } == true) ||
-                        (region.confidence == null && passScore >= selectedScore + MIN_VARIANT_ADVANTAGE)
+                    val readingQuality = if (lexical) {
+                        CyrillicReadingPlausibility.lexicalQuality(region.text)
+                    } else {
+                        CyrillicReadingPlausibility.score(region.text)
+                    }
+                    val plausibilityFloor = if (lexical) {
+                        MIN_CYRILLIC_LEXICAL_PLAUSIBILITY
+                    } else {
+                        MIN_CYRILLIC_READING_PLAUSIBILITY
+                    }
+                    val plausible = CyrillicReadingPlausibility.isUsableReading(region.text) &&
+                        readingQuality >= plausibilityFloor
+                    plausible && (
+                        pass === selected ||
+                            (region.confidence?.let { it >= MIN_CYRILLIC_MERGE_CONFIDENCE } == true) ||
+                            (region.confidence == null && passScore >= selectedScore + MIN_VARIANT_ADVANTAGE)
+                        )
                 }
                 .map { region -> OcrRegionCandidate(pass.name, passScore, region) }
         }
-        val merged = regionMerger.merge(mergeCandidates)
+        // Overlapping readings are grouped first; the final choice inside each group is
+        // made by cross-pass consensus and word plausibility rather than raw confidence.
+        val merged = regionMerger.merge(
+            mergeCandidates,
+            consensusReadings = true,
+            lexical = lexical,
+        )
         val marked = merged.regions.map { region ->
             markGeometry(region).copy(preprocessingVariant = TESSERACT_PASS)
         }
@@ -618,8 +695,31 @@ class OcrProcessor @Inject constructor(
         )
         val paragraphs = OcrParagraphMerger.merge(
             sanitized.regions.map { it.copy(text = OcrTextRepair.repair(it.text)) },
+            lexical = lexical,
         )
-        val regions = attachAppearance(paragraphs.map(::markGeometry), bitmap)
+        // Fragments and junk are gone by now, so the refinement budget goes to
+        // the paragraphs that survived and still read poorly.
+        val refined = refineCyrillicRegions(paragraphs, bitmap, lexical || lexicalRepair)
+            .map { it.copy(text = OcrTextRepair.repair(it.text)) }
+        // The lab may ask for lexicon-backed repair; the regular scan keeps the
+        // recognized words untouched even when a model would prefer another form.
+        val repaired = if (lexicalRepair) {
+            refined.map { it.copy(text = CyrillicLexicalRepair.repair(it.text)) }
+        } else {
+            refined
+        }
+        android.util.Log.i(
+            "LensLateOcr",
+            "merged=${merged.regions.size} sanitized=${sanitized.regions.size} " +
+                "paragraphs=${paragraphs.size}",
+        )
+        repaired.forEach { region ->
+            android.util.Log.i(
+                "LensLateOcr",
+                "region conf=${region.confidence} bounds=${region.bounds} text=${region.text.replace('\n', '/')}",
+            )
+        }
+        val regions = attachAppearance(repaired.map(::markGeometry), bitmap)
         val contributingPasses = merged.contributingPassNames.ifEmpty { setOf(selected.name) }
         val summaries = passes.map { pass ->
             PreprocessingCandidate(
@@ -809,12 +909,16 @@ class OcrProcessor @Inject constructor(
         )
     }
 
-    private fun scorePasses(passes: List<OcrPass>): Map<String, OcrScoreBreakdown> {
+    private fun scorePasses(
+        passes: List<OcrPass>,
+        lexical: Boolean = false,
+    ): Map<String, OcrScoreBreakdown> {
         val candidates = passes.map { it.candidate }
         return passes.mapIndexed { index, pass ->
             pass.name to OcrQualityScorer.evaluate(
                 candidate = candidates[index],
                 others = candidates.filterIndexed { otherIndex, _ -> otherIndex != index },
+                lexical = lexical,
             )
         }.toMap()
     }
@@ -912,6 +1016,10 @@ class OcrProcessor @Inject constructor(
                 alpha = 1f,
                 fontKey = style.fontKey.ifBlank { null },
                 fontMatchScore = style.fontMatchScore,
+                shadowColor = style.shadowColor.takeIf { style.shadowRadiusPx > 0f },
+                shadowRadiusPx = style.shadowRadiusPx.takeIf { it > 0f },
+                shadowOffsetX = style.shadowOffsetX.takeIf { style.shadowRadiusPx > 0f },
+                shadowOffsetY = style.shadowOffsetY.takeIf { style.shadowRadiusPx > 0f },
             ),
         )
     }
@@ -1036,6 +1144,212 @@ class OcrProcessor @Inject constructor(
         if (expected.isEmpty()) return true
         val available = refined.filter(Char::isDigit).groupingBy { it }.eachCount()
         return expected.all { (digit, count) -> (available[digit] ?: 0) >= count }
+    }
+
+    /**
+     * A page-level pass has to compromise between glow, gradients and paper texture;
+     * a tight crop of one block tolerates much stronger local normalization. The worst
+     * blocks are re-read from their own crop with the Russian model and replaced only
+     * when the new reading is both more plausible and better recognized.
+     */
+    private suspend fun refineCyrillicRegions(
+        regions: List<TextRegionRecord>,
+        bitmap: Bitmap,
+        lexical: Boolean = false,
+    ): List<TextRegionRecord> {
+        val plan = preprocessor.planRefinement(bitmap)
+        val qualityFloor = if (lexical) {
+            CYRILLIC_REFINEMENT_TARGET_LEXICAL
+        } else {
+            CYRILLIC_REFINEMENT_PLAUSIBILITY
+        }
+        val targets = regions
+            .withIndex()
+            .filter { (_, region) ->
+                if (!CyrillicReadingPlausibility.isUsableReading(region.text)) return@filter false
+                val confidence = region.confidence ?: 0f
+                val quality = if (lexical) {
+                    CyrillicReadingPlausibility.lexicalQuality(region.text)
+                } else {
+                    CyrillicReadingPlausibility.score(region.text)
+                }
+                // A well-recognized but non-existent word is exactly what a second
+                // look at its own crop can fix, so suspicion schedules refinement too.
+                confidence < CYRILLIC_REFINEMENT_CONFIDENCE ||
+                    quality < qualityFloor ||
+                    (lexical && CyrillicReadingPlausibility.isSuspectReading(region.text))
+            }
+            .sortedBy { (_, region) ->
+                val quality = if (lexical) {
+                    CyrillicReadingPlausibility.lexicalQuality(region.text)
+                } else {
+                    CyrillicReadingPlausibility.score(region.text)
+                }
+                (region.confidence ?: 0f) + quality
+            }
+            .take(if (lexical) MAX_CYRILLIC_LEXICAL_REFINEMENTS else MAX_CYRILLIC_REFINEMENTS)
+            .map { (index, _) -> index }
+            .toSet()
+        if (targets.isEmpty()) return regions
+        return regions.mapIndexed { index, region ->
+            if (index !in targets) region else refineCyrillicRegion(region, bitmap, plan, lexical)
+        }
+    }
+
+    private suspend fun refineCyrillicRegion(
+        region: TextRegionRecord,
+        bitmap: Bitmap,
+        plan: PreprocessingPlan,
+        lexical: Boolean = false,
+    ): TextRegionRecord {
+        val bounds = region.bounds
+        val padding = (maxOf(bounds.width, bounds.height) * CYRILLIC_REFINEMENT_PADDING)
+            .toInt()
+            .coerceIn(6, 40)
+        val left = (bounds.left.toInt() - padding).coerceIn(0, bitmap.width - 1)
+        val top = (bounds.top.toInt() - padding).coerceIn(0, bitmap.height - 1)
+        val right = (bounds.right.toInt() + padding).coerceIn(left + 1, bitmap.width)
+        val bottom = (bounds.bottom.toInt() + padding).coerceIn(top + 1, bitmap.height)
+        val crop = try {
+            Bitmap.createBitmap(bitmap, left, top, right - left, bottom - top)
+        } catch (_: IllegalArgumentException) {
+            return region
+        }
+        val scale = (CYRILLIC_REFINEMENT_HEIGHT / crop.height.coerceAtLeast(1))
+            .coerceIn(1f, CYRILLIC_REFINEMENT_MAX_UPSCALE)
+        val scaled = if (scale > 1.05f) {
+            Bitmap.createScaledBitmap(
+                crop,
+                (crop.width * scale).toInt().coerceAtLeast(1),
+                (crop.height * scale).toInt().coerceAtLeast(1),
+                true,
+            )
+        } else {
+            crop
+        }
+        val plausibilityFloor = if (lexical) {
+            CYRILLIC_REFINEMENT_LEXICAL
+        } else {
+            CYRILLIC_REFINEMENT_PLAUSIBILITY
+        }
+        val originalPlausibility = readingPlausibility(region.text, lexical)
+        val originalLetters = normalizedLetters(region.text).coerceAtLeast(1)
+        val currentScore = readingQuality(region.text, region.confidence, lexical)
+        var best = region
+        var bestScore = currentScore
+        try {
+            variantLoop@ for (spec in plan.variants) {
+                var variant: Bitmap? = null
+                try {
+                    val prepared = preprocessor.createVariant(scaled, plan, spec)
+                    variant = prepared
+                    // Layout segmentation reconstructs whole display lines that sparse
+                    // segmentation chops into fragments; run it where polarity changed.
+                    val modes = if (spec.stages.any { stage ->
+                            stage.operation == PreprocessOperation.INVERT ||
+                                stage.operation == PreprocessOperation.LOCAL_NORMALIZE
+                        }
+                    ) {
+                        listOf(
+                            TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT,
+                            TessBaseAPI.PageSegMode.PSM_AUTO,
+                        )
+                    } else {
+                        listOf(TessBaseAPI.PageSegMode.PSM_SPARSE_TEXT)
+                    }
+                    for (mode in modes) {
+                        val refinedRegions = tesseractEngine.recognize(prepared, mode)
+                        val text = refinedRegions
+                            .joinToString("\n") { it.text.trim() }
+                            .trim()
+                        if (text.isBlank()) continue
+                        if (!CyrillicReadingPlausibility.isUsableReading(text)) continue
+                        // A tight crop also catches neighbouring decoration. A long
+                        // reading made of punctuation and single letters would win the
+                        // completion bonus while replacing a real line with debris.
+                        if (!hasRealWords(text)) continue
+                        val confidences = refinedRegions.mapNotNull { it.confidence }
+                        val confidence = confidences.takeIf { it.isNotEmpty() }?.average()?.toFloat()
+                        val plausibility = readingPlausibility(text, lexical)
+                        if (plausibility < plausibilityFloor) continue
+                        if (plausibility < originalPlausibility - REFINEMENT_PLAUSIBILITY_TOLERANCE) {
+                            continue
+                        }
+                        if (!refinedPreservesDigits(region.text, text)) continue
+                        val score = readingQuality(text, confidence, lexical)
+                        val letters = normalizedLetters(text)
+                        val betterCompletion = letters >= originalLetters * REFINEMENT_COMPLETION_GAIN &&
+                            letters > normalizedLetters(best.text)
+                        if (score <= bestScore + CYRILLIC_REFINEMENT_MIN_GAIN && !betterCompletion) {
+                            continue
+                        }
+                        if (letters < originalLetters * 0.6f &&
+                            originalPlausibility >= PLAUSIBLE_ORIGINAL_READING
+                        ) {
+                            continue
+                        }
+                        best = region.copy(text = text, confidence = confidence)
+                        bestScore = maxOf(bestScore, score)
+                        if (score >= GOOD_REFINED_READING && confidence != null &&
+                            confidence >= GOOD_REFINED_CONFIDENCE
+                        ) {
+                            break@variantLoop
+                        }
+                    }
+                } catch (exception: CancellationException) {
+                    throw exception
+                } catch (_: Exception) {
+                    // A failed refinement variant keeps the previous reading.
+                } finally {
+                    if (variant != null && variant !== scaled && !variant.isRecycled) variant.recycle()
+                }
+            }
+        } finally {
+            scaled.recycle()
+            if (crop !== scaled) crop.recycle()
+        }
+        if (best !== region) {
+            android.util.Log.i(
+                "LensLateOcr",
+                "refined '${region.text.replace('\n', '/')}' -> '${best.text.replace('\n', '/')}' " +
+                    "${region.confidence}->${best.confidence}",
+            )
+        }
+        return best
+    }
+
+    private fun readingQuality(text: String, confidence: Float?, lexical: Boolean = false): Float {
+        val plausibility = readingPlausibility(text, lexical)
+        val safeConfidence = confidence?.takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0.5f
+        return if (lexical) {
+            0.35f * safeConfidence + 0.65f * plausibility
+        } else {
+            0.45f * safeConfidence + 0.55f * plausibility
+        }
+    }
+
+    private fun readingPlausibility(text: String, lexical: Boolean): Float =
+        if (lexical) {
+            CyrillicReadingPlausibility.lexicalQuality(text)
+        } else {
+            CyrillicReadingPlausibility.score(text)
+        }
+
+    private fun normalizedLetters(text: String): Int = text.count(Char::isLetter)
+
+    private fun hasRealWords(text: String): Boolean {
+        val tokens = text.split(REFINEMENT_TOKEN_SEPARATOR)
+            .filter { token -> token.any(Char::isLetterOrDigit) }
+        if (tokens.isEmpty()) return false
+        val real = tokens.count { token ->
+            token.count(Char::isLetter) >= MIN_REFINED_WORD_LETTERS ||
+                token.count(Char::isDigit) >= MIN_REFINED_NUMBER_DIGITS
+        }
+        if (real.toFloat() / tokens.size < MIN_REFINED_WORD_SHARE) return false
+        val singleLetters = tokens.count { token ->
+            token.count(Char::isLetter) == 1 && token.none(Char::isDigit)
+        }
+        return singleLetters <= MAX_REFINED_SINGLE_LETTERS
     }
 
     private fun markGeometry(region: TextRegionRecord): TextRegionRecord {
@@ -1163,8 +1477,32 @@ class OcrProcessor @Inject constructor(
         const val CYRILLIC_COMBINED_PASS = "tesseract-combined"
         // Deskew hypotheses are explicitly sorted to the front before this cap,
         // so a skewed page never loses its rotations to cheaper recipes.
-        const val MAX_CYRILLIC_PREPROCESS_PASSES = 10
-        const val MIN_CYRILLIC_MERGE_CONFIDENCE = 0.55f
+        const val MAX_CYRILLIC_PREPROCESS_PASSES = 12
+        // Low-confidence passes are still admitted: the ink check and the plausibility
+        // filter reject ghosts, while faint light-on-dark text lives below 0.55.
+        const val MIN_CYRILLIC_MERGE_CONFIDENCE = 0.38f
+        const val MIN_CYRILLIC_READING_PLAUSIBILITY = 0.3f
+        const val MIN_CYRILLIC_LEXICAL_PLAUSIBILITY = 0.35f
+        const val CYRILLIC_REFINEMENT_CONFIDENCE = 0.82f
+        const val CYRILLIC_REFINEMENT_PLAUSIBILITY = 0.62f
+        const val CYRILLIC_REFINEMENT_LEXICAL = 0.55f
+        const val CYRILLIC_REFINEMENT_TARGET_LEXICAL = 0.72f
+        const val REFINEMENT_PLAUSIBILITY_TOLERANCE = 0.12f
+        const val MAX_CYRILLIC_REFINEMENTS = 8
+        const val MAX_CYRILLIC_LEXICAL_REFINEMENTS = 12
+        const val CYRILLIC_REFINEMENT_PADDING = 0.08f
+        const val CYRILLIC_REFINEMENT_HEIGHT = 96f
+        const val CYRILLIC_REFINEMENT_MAX_UPSCALE = 3f
+        const val CYRILLIC_REFINEMENT_MIN_GAIN = 0.03f
+        const val REFINEMENT_COMPLETION_GAIN = 1.25f
+        const val PLAUSIBLE_ORIGINAL_READING = 0.7f
+        const val GOOD_REFINED_READING = 0.82f
+        const val GOOD_REFINED_CONFIDENCE = 0.8f
+        const val MIN_REFINED_WORD_LETTERS = 2
+        const val MIN_REFINED_NUMBER_DIGITS = 2
+        const val MIN_REFINED_WORD_SHARE = 0.6f
+        const val MAX_REFINED_SINGLE_LETTERS = 2
+        private val REFINEMENT_TOKEN_SEPARATOR = Regex("[^\\p{L}\\p{N}]+")
         // A genuine Russian page read by the rus model is overwhelmingly Cyrillic.
         // A few lookalike letters on a Latin page must not steal the auto-detection.
         const val MIN_CYRILLIC_LETTERS = 6

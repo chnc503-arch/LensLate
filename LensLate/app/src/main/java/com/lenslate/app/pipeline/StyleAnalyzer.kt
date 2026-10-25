@@ -11,7 +11,6 @@ import com.lenslate.app.model.TextStyleSample
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.math.abs
-import kotlin.math.atan
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -49,17 +48,34 @@ class StyleAnalyzer @Inject constructor() {
         }
 
         val background = estimateBackgroundColor(bitmap, rect)
-        val maxDistance = maxInkDistance(pixels, background)
+        // Which side of the paper the strokes occupy. On white-on-white
+        // posters the drop shadow is the strongest colour in the region, so
+        // "farthest from background" alone paints the shadow as ink.
+        val inkEstimate = InkColorSampler.estimateInk(pixels, width, background)
+        val maxDistance = inkEstimate?.distanceSq ?: maxInkDistance(pixels, background)
         if (maxDistance < MIN_USEFUL_INK_DISTANCE) {
             return fallback(region, bitmap)
         }
         val inkThreshold = max(MIN_INK_DISTANCE, maxDistance * INK_THRESHOLD_RATIO)
+        // The nominal floors are distances and maxDistance is already squared,
+        // so on washed-out ink the squared floor can exceed every real pixel
+        // and the whole glyph reads as background. Capping both thresholds
+        // below maxDistance keeps the faint core while leaving normal contrast
+        // on the old values.
+        val inkThresholdSq = min(inkThreshold * inkThreshold, maxDistance * FAINT_MASK_RATIO)
         val strongThreshold = max(inkThreshold * 1.45f, maxDistance * STRONG_INK_RATIO)
+        val strongThresholdSq = min(strongThreshold * strongThreshold, maxDistance * STRONG_SQ_CEILING)
+        val expectedLight = inkEstimate?.light
+        val backgroundLuminance = luminance(background)
         val mask = BooleanArray(pixels.size)
         var inkPixels = 0
         for (index in pixels.indices) {
-            val distance = colorDistanceSq(pixels[index], background)
-            if (distance >= inkThreshold * inkThreshold) {
+            val pixel = pixels[index]
+            if (expectedLight != null && (luminance(pixel) >= backgroundLuminance) != expectedLight) {
+                continue
+            }
+            val distance = colorDistanceSq(pixel, background)
+            if (distance >= inkThresholdSq) {
                 mask[index] = true
                 inkPixels++
             }
@@ -68,25 +84,63 @@ class StyleAnalyzer @Inject constructor() {
             return fallback(region, bitmap)
         }
 
-        val inkColor = estimateInkColor(pixels, background, strongThreshold)
+        val inkColor = inkEstimate?.color
+            ?: estimateInkColor(pixels, background, strongThresholdSq)
             ?: fallbackInkColor(background)
 
         val lineBoxes = region.lines.mapNotNull { line ->
             line.bounds?.toRect()?.let { clampRect(it, bitmap) }?.takeIf { !it.isEmpty }
         }
         val capHeight = estimateCapHeight(region, lineBoxes, height)
+        // A halo on the opposite side of the paper is the source drop shadow
+        // or glow. Its blur scales with the type size, and the centroid shift
+        // between halo and strokes approximates the shadow offset.
+        val shadow = inkEstimate?.takeIf { it.haloColor != null }
+        val shadowRadius = if (shadow != null) {
+            (capHeight * HALO_RADIUS_RATIO).coerceIn(MIN_HALO_RADIUS_PX, MAX_HALO_RADIUS_PX)
+        } else {
+            0f
+        }
+        val shadowColor = shadow?.haloColor ?: Color.TRANSPARENT
+        val shadowOffsetX = shadow?.haloOffsetX
+            ?.coerceIn(-shadowRadius * HALO_OFFSET_LIMIT, shadowRadius * HALO_OFFSET_LIMIT)
+            ?: 0f
+        val shadowOffsetY = shadow?.haloOffsetY
+            ?.coerceIn(-shadowRadius * HALO_OFFSET_LIMIT, shadowRadius * HALO_OFFSET_LIMIT)
+            ?: 0f
         val sizePx = (capHeight / CAP_HEIGHT_RATIO).coerceIn(MIN_FONT_SIZE, MAX_FONT_SIZE)
         val strokeWidth = estimateStrokeWidth(mask, width, height, capHeight)
         val density = estimateInkDensity(mask, width, height, lineBoxes)
         val weight = estimateWeight(strokeWidth, capHeight, density)
-        val mono = estimateMono(region, sizePx)
+        val mono = FontShapeEstimator.isMonospaced(
+            region.lines.map { line ->
+                line.elements
+                    .flatMap { element -> element.symbols }
+                    .mapNotNull { symbol ->
+                        symbol.bounds?.let { bounds ->
+                            GlyphBox(symbol.text, bounds.left, bounds.right)
+                        }
+                    }
+            },
+        )
         val alignment = estimateAlignment(region)
-        val slant = estimateSlant(mask, width, height, lineBoxes)
+        val slant = FontShapeEstimator.slantDegrees(
+            mask = mask,
+            width = width,
+            height = height,
+            lines = lineBoxes.map { TextLineSpan(it.left, it.top, it.right, it.bottom) },
+        )
         val letterSpacing = estimateLetterSpacing(region, sizePx, mono)
         val lineSpacing = estimateLineSpacing(region, sizePx)
         val underlined = detectDecoration(mask, width, height, lineBoxes, region, underline = true)
         val struckThrough = detectDecoration(mask, width, height, lineBoxes, region, underline = false)
-        val characterStyles = analyzeCharacterStyles(bitmap, region, background, inkColor)
+        val characterStyles = analyzeCharacterStyles(
+            bitmap,
+            region,
+            background,
+            inkColor,
+            expectedLight,
+        )
         val characterColors = characterStyles.mapNotNull { it.color }
 
         val fontMatch = matchFont(
@@ -114,7 +168,8 @@ class StyleAnalyzer @Inject constructor() {
                 "stroke=${"%.2f".format(strokeWidth)} w=$weight sl=${"%.1f".format(slant)} " +
                 "font=$fontKey score=${"%.2f".format(fontMatch?.score ?: 0f)} " +
                 "mix=${"%.2f".format(letterSpacing)} line=${"%.2f".format(lineSpacing)} " +
-                "dens=${"%.2f".format(density)} mono=$mono",
+                "dens=${"%.2f".format(density)} mono=$mono " +
+                "shadow=${shadowRadius}@${shadow?.haloColor}",
         )
 
         val style = TextStyle(
@@ -139,6 +194,10 @@ class StyleAnalyzer @Inject constructor() {
             isStruckThrough = struckThrough,
             fontKey = fontKey,
             fontMatchScore = fontMatch?.score ?: 0f,
+            shadowColor = shadowColor,
+            shadowRadiusPx = shadowRadius,
+            shadowOffsetX = shadowOffsetX,
+            shadowOffsetY = shadowOffsetY,
         )
         return RegionStyleAnalysis(
             style = style,
@@ -160,6 +219,7 @@ class StyleAnalyzer @Inject constructor() {
                 "strokeWidthPx" to 0.42f,
                 "isUnderlined" to if (underlined) 0.55f else 0.32f,
                 "isStruckThrough" to if (struckThrough) 0.5f else 0.32f,
+                "shadow" to if (shadow != null) 0.6f else 0.3f,
             ),
             fontClassConfidence = fontMatch?.score?.coerceAtLeast(0.3f) ?: if (mono) 0.62f else 0.5f,
         )
@@ -180,6 +240,7 @@ class StyleAnalyzer @Inject constructor() {
         region: TextRegionRecord,
         background: Int,
         fallbackColor: Int,
+        inkLight: Boolean?,
     ): List<TextStyleSample> {
         if (region.lines.isEmpty()) return emptyList()
         return region.lines.flatMap { line ->
@@ -190,7 +251,13 @@ class StyleAnalyzer @Inject constructor() {
             val scales = sizeTrend(units)
             units.mapIndexed { index, unit ->
                 TextStyleSample(
-                    color = sampleUnitColor(bitmap, unit.bounds, background, fallbackColor),
+                    color = sampleUnitColor(
+                        bitmap,
+                        unit.bounds,
+                        background,
+                        fallbackColor,
+                        inkLight,
+                    ),
                     scale = scales[index],
                 )
             }
@@ -219,6 +286,7 @@ class StyleAnalyzer @Inject constructor() {
         unitBounds: Bounds2D,
         background: Int,
         fallbackColor: Int,
+        inkLight: Boolean?,
     ): Int {
         val bounds = clampRect(unitBounds.toRect(), bitmap)
         if (bounds.width() < 2 || bounds.height() < 2) return fallbackColor
@@ -261,6 +329,8 @@ class StyleAnalyzer @Inject constructor() {
             glyphBottom = topPad + bounds.height(),
             backdrop = backdrop,
             fallbackInk = fallbackColor,
+            mode = InkColorSampler.Mode.ADAPTIVE,
+            inkLight = inkLight,
         )
     }
 
@@ -459,9 +529,8 @@ class StyleAnalyzer @Inject constructor() {
     private fun estimateInkColor(
         pixels: IntArray,
         background: Int,
-        strongThreshold: Float,
+        thresholdSq: Float,
     ): Int? {
-        val thresholdSq = strongThreshold * strongThreshold
         val stride = max(1, sqrt(pixels.size.toFloat() / MAX_COLOR_SAMPLES).toInt())
         val histogram = HashMap<Int, Int>()
         var index = 0
@@ -620,30 +689,16 @@ class StyleAnalyzer @Inject constructor() {
         if (capHeight <= 0f) return 400
         val ratio = strokeWidth / capHeight
         return when {
+            // Black display faces sit well above bold: without this tier the
+            // catalogue could only answer with 700 and every poster headline
+            // came out visibly lighter than the source.
+            ratio >= 0.22f || density >= 0.47f -> 900
             ratio >= 0.155f || density >= 0.38f -> 700
             ratio >= 0.125f || density >= 0.31f -> 600
             ratio >= 0.10f -> 500
             ratio >= 0.075f -> 400
             else -> 300
         }
-    }
-
-    private fun estimateMono(region: TextRegionRecord, sizePx: Float): Boolean {
-        val symbols = region.lines
-            .flatMap { it.elements }
-            .flatMap { it.symbols }
-            .filter { symbol ->
-                symbol.text.any(Char::isLetterOrDigit) &&
-                    (symbol.bounds?.width ?: 0f) > 1f
-            }
-        if (symbols.size < MIN_MONO_SYMBOLS) return false
-        val widths = symbols.map { it.bounds!!.width }
-        val average = widths.average().toFloat()
-        if (average <= 0f) return false
-        val variance = widths.map { (it - average) * (it - average) }.average().toFloat()
-        val coefficient = sqrt(variance) / average
-        val plausibleWidth = average in (sizePx * 0.22f)..(sizePx * 1.25f)
-        return coefficient <= MAX_MONO_WIDTH_VARIATION && plausibleWidth
     }
 
     private fun estimateAlignment(region: TextRegionRecord): String {
@@ -664,53 +719,6 @@ class StyleAnalyzer @Inject constructor() {
             rightSpread -> "right"
             else -> "left"
         }
-    }
-
-    private fun estimateSlant(
-        mask: BooleanArray,
-        width: Int,
-        height: Int,
-        lineBoxes: List<Rect>,
-    ): Float {
-        if (lineBoxes.isEmpty()) return 0f
-        val slopes = lineBoxes.mapNotNull { line ->
-            val pointsX = ArrayList<Float>()
-            val pointsY = ArrayList<Float>()
-            val top = line.top.coerceIn(0, height)
-            val bottom = line.bottom.coerceIn(top, height)
-            for (y in top until bottom) {
-                var sum = 0
-                var count = 0
-                val row = y * width
-                for (x in line.left.coerceIn(0, width) until line.right.coerceIn(0, width)) {
-                    if (mask[row + x]) {
-                        sum += x
-                        count++
-                    }
-                }
-                if (count >= MIN_SLANT_ROW_PIXELS) {
-                    pointsX += sum.toFloat() / count
-                    pointsY += y.toFloat()
-                }
-            }
-            if (pointsX.size < MIN_SLANT_ROWS) return@mapNotNull null
-            val meanX = pointsX.average().toFloat()
-            val meanY = pointsY.average().toFloat()
-            var covariance = 0f
-            var variance = 0f
-            for (index in pointsX.indices) {
-                val dy = pointsY[index] - meanY
-                covariance += (pointsX[index] - meanX) * dy
-                variance += dy * dy
-            }
-            if (variance <= 1e-4f) null else covariance / variance
-        }
-        if (slopes.isEmpty()) return 0f
-        val slope = slopes.sorted()[slopes.size / 2]
-        val degrees = Math.toDegrees(atan(slope.toDouble())).toFloat().coerceIn(-MAX_SLANT, MAX_SLANT)
-        // A real italic leans by eight degrees or more; tiny centroid drifts on
-        // short lines are noise and used to italicise upright subtitles.
-        return if (abs(degrees) < MIN_SLANT_DEGREES) 0f else degrees
     }
 
     private fun estimateLetterSpacing(
@@ -895,10 +903,22 @@ class StyleAnalyzer @Inject constructor() {
         val CAP_ASCENDER_CHARS = setOf('b', 'd', 'f', 'h', 'k', 'l', 't', 'б')
         const val MIN_FONT_SIZE = 5f
         const val MAX_FONT_SIZE = 400f
-        const val MIN_USEFUL_INK_DISTANCE = 0.012f
+        // Squared RGB distance, matching InkColorSampler: a glyph that differs
+        // from its backdrop by ~0.03 per channel is still real ink when the
+        // sampled core decides the colour. Extreme overexposure sits there.
+        const val MIN_USEFUL_INK_DISTANCE = 0.0008f
         const val MIN_INK_DISTANCE = 0.03f
         const val INK_THRESHOLD_RATIO = 0.35f
         const val STRONG_INK_RATIO = 0.55f
+        const val FAINT_MASK_RATIO = 0.60f
+        const val STRONG_SQ_CEILING = 0.60f
+        // CSS-like text shadows blur by roughly 5% of the cap height; the
+        // offset is measured from the halo/stroke centroids and stays inside
+        // a fraction of that blur.
+        const val HALO_RADIUS_RATIO = 0.055f
+        const val MIN_HALO_RADIUS_PX = 1.5f
+        const val MAX_HALO_RADIUS_PX = 14f
+        const val HALO_OFFSET_LIMIT = 0.8f
         const val LOCAL_BACKDROP_STRIP_RATIO = 0.30f
         const val MIN_LOCAL_STRIP_PAD = 2
         const val MAX_LOCAL_STRIP_PAD = 10
@@ -913,14 +933,10 @@ class StyleAnalyzer @Inject constructor() {
         const val DEFAULT_STROKE_RATIO = 0.09f
         const val STROKE_ANTIALIAS_SLACK = 0.4f
         const val MIN_STROKE_PX = 0.6f
-        const val MIN_MONO_SYMBOLS = 5
-        const val MAX_MONO_WIDTH_VARIATION = 0.24f
         const val MAX_ALIGNMENT_SPREAD = 0.35f
-        const val MIN_SLANT_ROW_PIXELS = 3
-        const val MIN_SLANT_ROWS = 6
-        const val MIN_SLANT_DEGREES = 2.2f
-        const val MIN_ITALIC_SLANT = 4f
-        const val MAX_SLANT = 30f
+        // Real italics lean by eight degrees or more; below six the shear
+        // estimate is indistinguishable from glyph-shape noise.
+        const val MIN_ITALIC_SLANT = 6f
         const val MIN_SPACING_SAMPLES = 3
         const val SANS_NATURAL_GAP_RATIO = 0.06f
         const val MONO_NATURAL_GAP_RATIO = 0.16f

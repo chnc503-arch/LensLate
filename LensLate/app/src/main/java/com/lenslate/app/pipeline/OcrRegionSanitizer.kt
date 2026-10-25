@@ -153,20 +153,41 @@ internal class OcrRegionSanitizer {
         var maximum = 0f
         var inkPixels = 0
         pixels.forEachIndexed { index, pixel ->
-            val distance = colorDistanceSq(pixel, background)
+            val distance = FaintInkSupport.distanceSq(pixel, background)
             if (distance > maximum) maximum = distance
             if (distance >= thresholdSq) {
                 inkPixels++
                 if (inkMask != null) inkMask[index] = true
             }
         }
-        if (maximum < flatDistance * flatDistance) return "flat-area"
         val share = inkPixels.toFloat() / pixels.size
-        if (share < minimumShare) return "no-ink"
+        if (maximum < flatDistance * flatDistance || share < minimumShare) {
+            // Faint ink (white on white, near-black on black) never reaches the
+            // standard ink distance, so the region would be discarded even though
+            // the OCR reading and the glyph layout are real. Retry with a
+            // threshold derived from the measured contrast, but only for small
+            // regions whose pixels still look like several glyphs.
+            if (checkStructure && maximum in FAINT_MIN_DISTANCE_SQ..FAINT_MAX_DISTANCE_SQ &&
+                FaintInkSupport.hasSupport(
+                    region = region,
+                    maximum = maximum,
+                    pixels = pixels,
+                    width = width,
+                    height = height,
+                    offsetX = left,
+                    offsetY = top,
+                    background = background,
+                    glyphCount = glyphCount,
+                )
+            ) {
+                return null
+            }
+            return if (maximum < flatDistance * flatDistance) "flat-area" else "no-ink"
+        }
         val uniformLimit = if (aggressive) UNIFORM_FIELD_LIMIT_AGGRESSIVE else UNIFORM_FIELD_LIMIT
         if (share > uniformLimit) return "uniform-field"
         if ((profile == OcrSanitizerProfile.TESSERACT || aggressive) &&
-            !hasGlyphSupport(region, pixels, width, height, left, top, background, thresholdSq)
+            !FaintInkSupport.glyphsHaveInk(region, pixels, width, height, left, top, background, thresholdSq)
         ) {
             return "blank-glyphs"
         }
@@ -185,58 +206,6 @@ internal class OcrRegionSanitizer {
         } else {
             NEURAL_STRUCTURE_CONFIDENCE
         }
-
-    /**
-     * Every non-space glyph should cover a few percent of its own box. Boxes on
-     * blank paper score zero; boxes filled by a shadow gradient score almost one.
-     * A text line keeps a clear mixture of ink and background.
-     */
-    private fun hasGlyphSupport(
-        region: TextRegionRecord,
-        pixels: IntArray,
-        width: Int,
-        height: Int,
-        offsetX: Int,
-        offsetY: Int,
-        background: Int,
-        thresholdSq: Float,
-    ): Boolean {
-        val symbols = region.lines
-            .flatMap { it.elements }
-            .flatMap { it.symbols }
-            .filter { it.text.any(Char::isLetterOrDigit) }
-        if (symbols.size < MIN_SYMBOLS_FOR_SUPPORT) return true
-        var sampled = 0
-        var supported = 0
-        symbols.take(MAX_SYMBOLS_TO_CHECK).forEach { symbol ->
-            val bounds = symbol.bounds ?: return@forEach
-            val left = (bounds.left.toInt() - offsetX).coerceIn(0, width - 1)
-            val top = (bounds.top.toInt() - offsetY).coerceIn(0, height - 1)
-            val right = (bounds.right.toInt() - offsetX).coerceIn(left + 1, width)
-            val bottom = (bounds.bottom.toInt() - offsetY).coerceIn(top + 1, height)
-            if (right - left < 2 || bottom - top < 2) return@forEach
-            var ink = 0
-            var maximum = 0f
-            var total = 0
-            for (y in top until bottom) {
-                val row = y * width
-                for (x in left until right) {
-                    val distance = colorDistanceSq(pixels[row + x], background)
-                    if (distance > maximum) maximum = distance
-                    if (distance >= thresholdSq) ink++
-                    total++
-                }
-            }
-            if (total == 0) return@forEach
-            sampled++
-            val share = ink.toFloat() / total
-            if (maximum >= thresholdSq && share in SYMBOL_INK_SHARE_MIN..SYMBOL_INK_SHARE_MAX) {
-                supported++
-            }
-        }
-        if (sampled == 0) return true
-        return supported.toFloat() / sampled >= MIN_SUPPORTED_SYMBOL_SHARE
-    }
 
     private fun estimateRingBackground(
         bitmap: Bitmap,
@@ -416,13 +385,6 @@ internal class OcrRegionSanitizer {
         }
     }
 
-    private fun colorDistanceSq(first: Int, second: Int): Float {
-        val red = ((first shr 16) and 0xFF) - ((second shr 16) and 0xFF)
-        val green = ((first shr 8) and 0xFF) - ((second shr 8) and 0xFF)
-        val blue = (first and 0xFF) - (second and 0xFF)
-        return (red * red + green * green + blue * blue).toFloat()
-    }
-
     private fun drop(region: TextRegionRecord, reason: String): OcrSanitizerDrop =
         OcrSanitizerDrop(region.text, reason, region.confidence)
 
@@ -434,13 +396,10 @@ internal class OcrRegionSanitizer {
         const val TESSERACT_MIN_INK_SHARE = 0.012f
         const val AGGRESSIVE_MIN_INK_SHARE = 0.018f
         const val NEURAL_MIN_INK_SHARE = 0.006f
+        const val FAINT_MIN_DISTANCE_SQ = 64f
+        const val FAINT_MAX_DISTANCE_SQ = 3136f
         const val UNIFORM_FIELD_LIMIT = 0.85f
         const val UNIFORM_FIELD_LIMIT_AGGRESSIVE = 0.78f
-        const val SYMBOL_INK_SHARE_MIN = 0.015f
-        const val SYMBOL_INK_SHARE_MAX = 0.9f
-        const val MIN_SUPPORTED_SYMBOL_SHARE = 0.34f
-        const val MIN_SYMBOLS_FOR_SUPPORT = 3
-        const val MAX_SYMBOLS_TO_CHECK = 96
         const val INK_MIN_REGION_SIDE = 6
         const val NEURAL_TRUST_CONFIDENCE = 0.55f
         const val MIN_GLYPHS_FOR_STRUCTURE = 3

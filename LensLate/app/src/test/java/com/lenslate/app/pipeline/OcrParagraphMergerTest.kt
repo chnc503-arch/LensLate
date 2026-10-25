@@ -24,6 +24,7 @@ class OcrParagraphMergerTest {
         top: Float,
         right: Float,
         bottom: Float,
+        confidence: Float = 0.8f,
     ): TextRegionRecord {
         val bounds = Bounds2D(left, top, right, bottom)
         val line = TextLineRecord(
@@ -31,7 +32,7 @@ class OcrParagraphMergerTest {
             bounds = bounds,
             polygon = polygon(left, top, right, bottom),
             angleDegrees = 0f,
-            confidence = 0.8f,
+            confidence = confidence,
             elements = emptyList(),
         )
         return TextRegionRecord(
@@ -41,9 +42,68 @@ class OcrParagraphMergerTest {
             polygon = line.polygon,
             script = "Cyrillic",
             readingOrder = id - 1,
+            confidence = confidence,
+            overallConfidence = confidence,
+            lines = listOf(line),
+        )
+    }
+
+    private fun block(
+        id: Int,
+        text: String,
+        left: Float,
+        top: Float,
+        right: Float,
+        bottom: Float,
+        lineTexts: List<String>,
+    ): TextRegionRecord {
+        val lineHeight = (bottom - top) / lineTexts.size
+        val lines = lineTexts.mapIndexed { index, lineText ->
+            val lineTop = top + index * lineHeight
+            TextLineRecord(
+                text = lineText,
+                bounds = Bounds2D(left, lineTop, right, lineTop + lineHeight),
+                polygon = polygon(left, lineTop, right, lineTop + lineHeight),
+                angleDegrees = 0f,
+                confidence = 0.8f,
+                elements = emptyList(),
+            )
+        }
+        val bounds = Bounds2D(left, top, right, bottom)
+        return TextRegionRecord(
+            id = id,
+            text = text,
+            bounds = bounds,
+            polygon = polygon(left, top, right, bottom),
+            script = "Cyrillic",
+            readingOrder = id - 1,
             confidence = 0.8f,
             overallConfidence = 0.8f,
-            lines = listOf(line),
+            lines = lines,
+        )
+    }
+
+    @Test
+    fun complementaryBlocksWithSharedBoundaryLineAreJoined() {
+        val upper = block(
+            id = 1,
+            text = "Первая строка\nнескольких уровнях яркости.",
+            left = 40f, top = 100f, right = 900f, bottom = 160f,
+            lineTexts = listOf("Первая строка", "нескольких уровнях яркости."),
+        )
+        val lower = block(
+            id = 2,
+            text = "нескольких уровнях яркости.\nПроверка идёт по всей строке.",
+            left = 40f, top = 168f, right = 900f, bottom = 228f,
+            lineTexts = listOf("нескольких уровнях яркости.", "Проверка идёт по всей строке."),
+        )
+
+        val result = OcrParagraphMerger.merge(listOf(upper, lower))
+
+        assertEquals(1, result.size)
+        assertEquals(
+            "Первая строка\nнескольких уровнях яркости.\nПроверка идёт по всей строке.",
+            result[0].text,
         )
     }
 
@@ -126,5 +186,69 @@ class OcrParagraphMergerTest {
         assertEquals(0, result[0].readingOrder)
         assertEquals(2, result[1].id)
         assertEquals(1, result[1].readingOrder)
+    }
+
+    @Test
+    fun containedFragmentsDoNotSurviveAsSeparateBlocks() {
+        val paragraph = region(
+            1,
+            "Проверка идёт по всей строке: оттенок медленно уходит из холодного серого в тёплый уголь.",
+            104f, 948f, 1005f, 1103f,
+            confidence = 0.85f,
+        )
+        val fragments = listOf(
+            region(2, "оттенок медленно уходит из", 556f, 952f, 964f, 978f, confidence = 0.91f),
+            region(3, "холодного серого в тёплый уголь", 104f, 983f, 713f, 1022f, confidence = 0.9f),
+            region(4, "оуходитиз", 800f, 953f, 964f, 978f, confidence = 0.88f),
+        )
+
+        val result = OcrParagraphMerger.merge(listOf(paragraph) + fragments)
+
+        assertEquals(1, result.size)
+        assertEquals(paragraph.text, result[0].text)
+    }
+
+    @Test
+    fun shortFragmentInsideLargerLineIsDropped() {
+        val line = region(1, "ОДИН ВЕЧЕР · ОДНА СЦЕНА", 85f, 1305f, 627f, 1336f, confidence = 0.9f)
+        val fragment = region(2, "Од", 378f, 1305f, 431f, 1336f, confidence = 0.95f)
+
+        val result = OcrParagraphMerger.merge(listOf(line, fragment))
+
+        assertEquals(1, result.size)
+        assertEquals(line.text, result[0].text)
+    }
+
+    @Test
+    fun partiallyOverlappingDifferentColumnsStaySeparate() {
+        val left = region(1, "Левая колонка с текстом", 40f, 300f, 400f, 400f)
+        val right = region(2, "Правая колонка с другим текстом", 370f, 300f, 800f, 400f)
+
+        val result = OcrParagraphMerger.merge(listOf(left, right))
+
+        assertEquals(2, result.size)
+    }
+
+    @Test
+    fun adjacentRepeatedLineIsAbsorbedIntoParagraphBounds() {
+        val paragraph = region(
+            1,
+            "нескольких уровнях яркости. Проверка идёт по всей строке: оттенок уходит в тёплый угол.",
+            70f, 947f, 1020f, 1200f,
+            confidence = 0.87f,
+        )
+        val repeatedLine = region(
+            2,
+            "нескольких уровнях яркости.",
+            104f, 913f, 520f, 936f,
+            confidence = 0.8f,
+        )
+
+        val result = OcrParagraphMerger.merge(listOf(paragraph, repeatedLine))
+
+        assertEquals(1, result.size)
+        assertEquals(paragraph.text, result[0].text)
+        assertEquals(913f, result[0].bounds.top, 0.01f)
+        assertEquals(2, result[0].lines.size)
     }
 }

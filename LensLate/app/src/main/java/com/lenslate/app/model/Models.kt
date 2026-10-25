@@ -49,6 +49,11 @@ data class TextStyle(
     val fontMatchScore: Float = 0f,
     /** Measured distance between source baselines, in pixels. */
     val linePitchPx: Float? = null,
+    /** Drop shadow / glow colour; transparent when the source has none. */
+    val shadowColor: Int = 0,
+    val shadowRadiusPx: Float = 0f,
+    val shadowOffsetX: Float = 0f,
+    val shadowOffsetY: Float = 0f,
 )
 
 /**
@@ -390,6 +395,10 @@ data class TextAppearanceEstimate(
     val alpha: Float? = null,
     val fontKey: String? = null,
     val fontMatchScore: Float? = null,
+    val shadowColor: Int? = null,
+    val shadowRadiusPx: Float? = null,
+    val shadowOffsetX: Float? = null,
+    val shadowOffsetY: Float? = null,
 )
 
 /** Circle fitted through the centers of the source glyphs. */

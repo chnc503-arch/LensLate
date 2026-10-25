@@ -7,6 +7,7 @@ import android.graphics.Paint
 import android.graphics.Rect
 import kotlin.math.abs
 import kotlin.math.ceil
+import kotlin.math.ln
 import kotlin.math.max
 
 internal data class FontMatch(
@@ -52,12 +53,20 @@ internal object FontMatcher {
 
         var best: FontMatch? = null
         FontCatalog.matchable.forEach { variant ->
-            if (variant.italic && !italicHint) return@forEach
             // Ink-mask IoU rewards extra coverage, so a bold face can win on a
             // regular source purely because anti-aliasing thickened the mask.
             // The independently measured weight has the final say on that axis.
             if (weightHint <= MAX_REGULAR_HINT && variant.weight >= BOLD_VARIANT_WEIGHT) {
                 return@forEach
+            }
+            // An upright face cannot imitate a real lean and vice versa, so the
+            // shape comparison decides; the hint only nudges close calls. The
+            // old hard filter missed italics whose slant estimate came out low
+            // and forced an upright face onto slanted source text.
+            val slantPenalty = when {
+                variant.italic && !italicHint -> ITALIC_WITHOUT_HINT_PENALTY
+                !variant.italic && italicHint -> UPRIGHT_WITH_ITALIC_HINT_PENALTY
+                else -> 0f
             }
             val typeface = FontCatalog.typeface(variant.key) ?: return@forEach
             val candidate = renderCandidate(
@@ -72,7 +81,14 @@ internal object FontMatcher {
             val shapeScore = similarity(sourceGrid, candidateGrid)
             val weightBonus = WEIGHT_BONUS *
                 (1f - (abs(variant.weight - weightHint) / 500f)).coerceIn(0f, 1f)
-            val score = (shapeScore + weightBonus).coerceIn(0f, 1f)
+            // Rasterization stretches both shapes to one grid, so the width
+            // evidence survives only here. Monospace advances render wider
+            // than proportional ones; without this term a heavy sans can be
+            // replaced by mono-bold purely because both silhouettes are dense.
+            val widthRatio = sourceBox.width().toFloat() / max(1, candidate.bounds.width())
+            val widthDeviation = abs(ln(widthRatio.coerceAtLeast(0.2f))) / LN_MAX_WIDTH_DEVIATION
+            val widthBonus = WIDTH_BONUS * (1f - widthDeviation.coerceIn(0f, 1f))
+            val score = (shapeScore + weightBonus + widthBonus - slantPenalty).coerceIn(0f, 1f)
             if (best == null || score > best!!.score) {
                 best = FontMatch(
                     variant = variant,
@@ -212,7 +228,12 @@ internal object FontMatcher {
     private const val MIN_MATCH_SCORE = 0.16f
     private const val MIN_HORIZONTAL_SCALE = 0.45f
     private const val MAX_HORIZONTAL_SCALE = 1.6f
-    private const val WEIGHT_BONUS = 0.03f
+    private const val WEIGHT_BONUS = 0.05f
+    private const val WIDTH_BONUS = 0.02f
+    private const val MAX_WIDTH_DEVIATION_RATIO = 1.35f
+    private val LN_MAX_WIDTH_DEVIATION = ln(MAX_WIDTH_DEVIATION_RATIO)
+    private const val ITALIC_WITHOUT_HINT_PENALTY = 0.025f
+    private const val UPRIGHT_WITH_ITALIC_HINT_PENALTY = 0.02f
     private const val MAX_REGULAR_HINT = 500
     private const val BOLD_VARIANT_WEIGHT = 700
 }

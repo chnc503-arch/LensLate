@@ -20,10 +20,21 @@ internal data class OcrRegionMergeResult(
 /** Combines independent OCR passes while suppressing duplicate detections in source coordinates. */
 internal class OcrRegionMerger {
 
-    fun merge(candidates: List<OcrRegionCandidate>): OcrRegionMergeResult {
+    /**
+     * [consensusReadings] switches the final choice inside every overlap group from
+     * "highest per-word confidence" to "reading most passes agree on, provided its
+     * words look like real Russian". Confidence alone prefers truncated fragments
+     * and invented acronyms, which is exactly how a poster title loses its second word.
+     */
+    fun merge(
+        candidates: List<OcrRegionCandidate>,
+        consensusReadings: Boolean = false,
+        lexical: Boolean = false,
+    ): OcrRegionMergeResult {
         if (candidates.isEmpty()) return OcrRegionMergeResult(emptyList(), emptySet())
 
         val winners = mutableListOf<RankedRegion>()
+        val supporters = mutableListOf<MutableList<RankedRegion>>()
         candidates
             .filter { it.region.text.isNotBlank() }
             .map { RankedRegion(it, quality(it)) }
@@ -32,10 +43,22 @@ internal class OcrRegionMerger {
                 val duplicateIndex = winners.indexOfFirst { isDuplicate(candidate.candidate.region, it.candidate.region) }
                 if (duplicateIndex < 0) {
                     winners += candidate
+                    supporters += mutableListOf<RankedRegion>()
                 } else if (shouldReplace(winners[duplicateIndex], candidate)) {
+                    supporters[duplicateIndex] += winners[duplicateIndex]
                     winners[duplicateIndex] = candidate
+                } else {
+                    supporters[duplicateIndex] += candidate
                 }
             }
+        if (consensusReadings) {
+            winners.indices.forEach { index ->
+                winners[index] = selectConsensusReading(
+                    listOf(winners[index]) + supporters[index],
+                    lexical,
+                )
+            }
+        }
 
         val ordered = winners.sortedWith(
             compareBy<RankedRegion> { it.candidate.region.bounds.top }
@@ -49,6 +72,47 @@ internal class OcrRegionMerger {
             regions = regions,
             contributingPassNames = ordered.mapTo(linkedSetOf()) { it.candidate.passName },
         )
+    }
+
+    private fun selectConsensusReading(
+        group: List<RankedRegion>,
+        lexical: Boolean,
+    ): RankedRegion {
+        if (group.size == 1) return group.first()
+        return group.maxByOrNull { ranked -> readingScore(ranked, group, lexical) } ?: group.first()
+    }
+
+    private fun readingScore(
+        ranked: RankedRegion,
+        group: List<RankedRegion>,
+        lexical: Boolean,
+    ): Float {
+        val text = ranked.candidate.region.text
+        val length = normalizedLength(text)
+        val maxLength = group.maxOf { normalizedLength(it.candidate.region.text) }.coerceAtLeast(1)
+        val support = group.count { other ->
+            textSimilarity(other.candidate.region.text, text) >= CONSENSUS_TEXT_SIMILARITY
+        } / group.size.toFloat()
+        val confidence = ranked.candidate.region.confidence
+            ?.takeIf(Float::isFinite)
+            ?.coerceIn(0f, 1f)
+            ?: 0f
+        val passScore = ranked.candidate.passScore
+            .takeIf(Float::isFinite)
+            ?.coerceIn(0f, 1f)
+            ?: 0f
+        val plausibility = if (lexical) {
+            CyrillicReadingPlausibility.lexicalQuality(text)
+        } else {
+            CyrillicReadingPlausibility.score(text)
+        }
+        val floor = if (lexical) LEXICAL_PLAUSIBILITY_FLOOR else PLAUSIBILITY_FLOOR
+        val digitBonus = if (text.any(Char::isDigit)) DIGIT_QUALITY_BONUS else 0f
+        val base = CONFIDENCE_WEIGHT * confidence +
+            PASS_SCORE_WEIGHT * passScore +
+            SUPPORT_WEIGHT * support +
+            LENGTH_WEIGHT * (length.toFloat() / maxLength)
+        return base * (floor + (1f - floor) * plausibility) + digitBonus
     }
 
     private fun quality(candidate: OcrRegionCandidate): Float {
@@ -191,5 +255,14 @@ internal class OcrRegionMerger {
         const val GEOMETRY_EPSILON = 1e-4f
         const val DIGIT_QUALITY_BONUS = 0.06f
         const val DIGIT_PREFERENCE_QUALITY_MARGIN = 0.2f
+        const val CONSENSUS_TEXT_SIMILARITY = 0.5f
+        const val CONFIDENCE_WEIGHT = 0.34f
+        const val PASS_SCORE_WEIGHT = 0.16f
+        const val SUPPORT_WEIGHT = 0.22f
+        const val LENGTH_WEIGHT = 0.12f
+        const val PLAUSIBILITY_FLOOR = 0.72f
+        // The lab's lexical evidence is decisive: a reading full of invented
+        // words must lose even when its OCR confidence is higher.
+        const val LEXICAL_PLAUSIBILITY_FLOOR = 0.45f
     }
 }
