@@ -12,9 +12,11 @@
 
 ### [⬇ Скачать LensLate-debug.apk](https://github.com/chnc503-arch/LensLate/releases/latest/download/LensLate-debug.apk)
 
+Бета-сборки с самыми свежими правками наложения: [⬇ 1.4.0-beta.2](https://github.com/chnc503-arch/LensLate/releases/download/v1.4.0-beta.2/LensLate-debug.apk)
+
 | | |
 |---|---|
-| Версия | 1.3.0 (versionCode 4) |
+| Версия | 1.3.0 (versionCode 4) · бета 1.4.0-beta.2 (versionCode 6) |
 | Требования | Android 8.0+ (API 26), arm64-v8a / armeabi-v7a / x86_64 |
 | Размер | ≈107 МБ |
 | Подпись | debug-ключ (сборка для тестирования, не для Google Play) |
